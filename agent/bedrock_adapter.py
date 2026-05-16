@@ -82,9 +82,16 @@ def _get_bedrock_runtime_client(region: str):
     Without this promotion, boto3's default chain cannot resolve credentials
     and raises "could not resolve credentials from session" — even though
     runtime_provider.py correctly routed the call to bedrock_converse mode.
+
+    The client is configured with a generous ``read_timeout`` (default 900s,
+    overridable via ``HERMES_BEDROCK_READ_TIMEOUT``) because large prompts can
+    take significant time before Bedrock returns the first byte — especially
+    for high-capability models like Opus processing 100K+ token contexts.
+    The boto3 default of 60s is insufficient for agentic workloads.
     """
     if region not in _bedrock_runtime_client_cache:
         boto3 = _require_boto3()
+        from botocore.config import Config as BotoConfig
 
         # Promote Hermes-specific bearer token to the standard boto3 env var
         # so the default credential chain can resolve it automatically.
@@ -92,8 +99,15 @@ def _get_bedrock_runtime_client(region: str):
         if _bearer and not os.environ.get("AWS_BEARER_TOKEN", "").strip():
             os.environ["AWS_BEARER_TOKEN"] = _bearer
 
+        _read_timeout = int(os.environ.get("HERMES_BEDROCK_READ_TIMEOUT", 900))
+        _connect_timeout = int(os.environ.get("HERMES_BEDROCK_CONNECT_TIMEOUT", 10))
         _bedrock_runtime_client_cache[region] = boto3.client(
             "bedrock-runtime", region_name=region,
+            config=BotoConfig(
+                read_timeout=_read_timeout,
+                connect_timeout=_connect_timeout,
+                retries={"max_attempts": 2},
+            ),
         )
     return _bedrock_runtime_client_cache[region]
 
