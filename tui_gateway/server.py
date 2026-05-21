@@ -1393,6 +1393,27 @@ def _session_info(agent) -> dict:
     ):
         reasoning_effort = str(reasoning_config.get("effort", "") or "")
     service_tier = getattr(agent, "service_tier", None) or ""
+    # ── Blue/green slot detection ──
+    slot_name = ""
+    slot_branch = ""
+    try:
+        _hermes_home = os.path.expanduser("~/.hermes")
+        _link = os.path.join(_hermes_home, "hermes-agent")
+        if os.path.islink(_link):
+            _target = os.path.basename(os.readlink(_link))
+            slot_name = _target.replace("hermes-agent-", "")  # "blue" or "green"
+            # Get branch name for extra context
+            import subprocess
+            _slot_dir = os.path.join(_hermes_home, _target)
+            _branch = subprocess.run(
+                ["git", "branch", "--show-current"],
+                cwd=_slot_dir, capture_output=True, text=True, timeout=2
+            )
+            if _branch.returncode == 0 and _branch.stdout.strip():
+                slot_branch = _branch.stdout.strip()
+    except Exception:
+        pass
+
     info: dict = {
         "model": getattr(agent, "model", ""),
         "reasoning_effort": reasoning_effort,
@@ -1407,6 +1428,7 @@ def _session_info(agent) -> dict:
         "update_command": "",
         "usage": _get_usage(agent),
         "profile_name": _current_profile_name(),
+        "slot": f"{slot_name} · {slot_branch}" if slot_name and slot_branch else slot_name,
     }
     try:
         from hermes_cli import __version__, __release_date__
