@@ -442,6 +442,51 @@ receiving your response — give it what it needs to succeed independently.
 
 At every oversight checkpoint, the upper model produces a compressed context package regardless of oversight action. This is the mechanism that gives the lower model effectively unlimited session length.
 
+#### Core Insight: Adaptive Compression Targeting
+
+The upper model doesn't just compress — it **targets a specific output size** based on observed session dynamics. Because the upper model has full visibility into the session history, it knows:
+
+1. **How much context the lower model uses per turn** (observed average over the session)
+2. **How many turns until the next checkpoint** (configured interval)
+3. **The lower model's total context budget** (from capability graph)
+4. **The current system prompt + tool definitions overhead** (relatively stable)
+
+This means the upper model can calculate:
+
+```
+headroom_needed = avg_tokens_per_turn × turns_until_next_checkpoint × safety_margin
+max_summary_size = lower_model_context_budget - system_prompt_size - headroom_needed - recent_raw_turns_size
+```
+
+If the session has been using 3K tokens per turn and the next checkpoint is 10 turns away:
+- `headroom_needed = 3000 × 10 × 1.3 = 39,000 tokens`
+- For a 256K context model: `max_summary_size = 256K - 8K(sys) - 39K(headroom) - 6K(recent) = ~203K`
+
+That's generous. But if the session involves lots of code dumps and the per-turn average is 15K:
+- `headroom_needed = 15000 × 10 × 1.3 = 195,000 tokens`
+- `max_summary_size = 256K - 8K - 195K - 6K = ~47K`
+
+The compression adapts dynamically. Early in a session with small turns, the summary can be expansive. In a code-heavy session with huge tool outputs, it compresses more aggressively.
+
+#### Differential Compression
+
+Rather than replacing the entire summary at each checkpoint, the upper model performs differential updates:
+
+```
+Previous summary (from checkpoint N-1)
+    + New decisions made (turns N-1 to N)
+    + Completed work (mark done, collapse detail)
+    + Active threads (keep full detail)
+    − Dead ends (remove entirely)
+    − Superseded context (old state replaced by new)
+    = New summary (for checkpoint N)
+```
+
+This means the summary **grows slowly and organically** rather than being rewritten from scratch. Key benefits:
+- Stable facts don't get lost to summarization drift
+- The lower model sees consistent framing across checkpoints (less disorienting)
+- Cheaper for the upper model (it only needs to reason about the delta, not re-summarize everything)
+
 #### Compression Architecture
 
 ```
@@ -455,9 +500,9 @@ At every oversight checkpoint, the upper model produces a compressed context pac
 │ (action)│       │  (context)   │      │   (package)    │
 └─────────┘       └──────────────┘      └────────────────┘
     │                      │                      │
-    │ approve/correct/     │ compressed           │ structured
-    │ escalate/flag        │ summary              │ prompt for
-    │                      │                      │ lower model
+    │ approve/correct/     │ differential         │ structured
+    │ escalate/flag        │ summary + target     │ prompt for
+    │                      │ size from budget     │ lower model
     └──────────────────────┴──────────────────────┘
                            │
                            ▼
@@ -469,28 +514,45 @@ At every oversight checkpoint, the upper model produces a compressed context pac
 
 ```
 You are compressing a conversation for handoff to a less capable model.
-It needs to continue working seamlessly. Produce a structured summary:
+It needs to continue working seamlessly.
 
-## Session State
+## Compression Parameters
+- Target summary size: {max_summary_tokens} tokens (HARD LIMIT — do not exceed)
+- Previous summary (update differentially): {previous_summary}
+- New turns to incorporate: {recent_turns}
+- Average context per turn this session: {avg_tokens_per_turn}
+- Turns until next checkpoint: {turns_until_checkpoint}
+
+## Instructions
+Update the previous summary differentially:
+1. ADD new decisions, discoveries, and state changes from the recent turns
+2. MARK COMPLETE any work that finished — collapse to one-line acknowledgment
+3. KEEP FULL DETAIL on active threads and in-progress work
+4. REMOVE dead ends, abandoned approaches, and superseded state
+5. TRIM older completed items if approaching the token limit
+
+## Output Structure
+
+### Session State
 - What the user originally asked for
-- What has been accomplished so far
-- What is currently in progress
+- What has been accomplished so far (brief)
+- What is currently in progress (detailed)
 - What remains to be done
 
-## Key Decisions Made
-- [Decision]: [rationale] (turn N)
+### Key Decisions Made
+- [Decision]: [rationale] (keep all — these are never trimmed)
 
-## Active Context
+### Active Context
 - Files being worked on and their current state
-- Environment state that matters (running processes, git branch, etc.)
+- Environment state (running processes, git branch, etc.)
 - Constraints or requirements discovered during work
 
-## Guidance for Next Steps
+### Guidance for Next Steps
 - What the model should do next
-- Any pitfalls to avoid (learned from this session)
+- Pitfalls to avoid (learned from this session)
 - Approach recommendations
 
-Keep this under 3000 tokens. Prioritize actionability over completeness.
+Prioritize actionability over completeness.
 The model receiving this has tools — it can look things up. Focus on
 what it can't rediscover: decisions, rationale, and current state.
 ```
@@ -525,11 +587,75 @@ def rebuild_context_after_oversight(self, compressed_summary: str, recent_turns:
                 f"({compression_ratio:.1f}x reduction)")
 ```
 
+#### Adaptive Budget Calculation
+
+```python
+class CompressionBudget:
+    """Calculates target summary size based on session dynamics."""
+    
+    def __init__(self, lower_model_context_budget: int, system_prompt_tokens: int,
+                 checkpoint_interval: int, safety_margin: float = 1.3):
+        self.context_budget = lower_model_context_budget
+        self.system_tokens = system_prompt_tokens
+        self.checkpoint_interval = checkpoint_interval
+        self.safety_margin = safety_margin
+        self.turn_token_history: List[int] = []
+    
+    def record_turn(self, tokens_used: int):
+        """Track how many tokens each turn adds to context."""
+        self.turn_token_history.append(tokens_used)
+    
+    @property
+    def avg_tokens_per_turn(self) -> int:
+        if not self.turn_token_history:
+            return 3000  # conservative default
+        # Use recent window (last 20 turns) weighted toward recent
+        recent = self.turn_token_history[-20:]
+        return int(sum(recent) / len(recent))
+    
+    @property
+    def p90_tokens_per_turn(self) -> int:
+        """90th percentile — accounts for spiky turns (large code dumps)."""
+        if len(self.turn_token_history) < 5:
+            return self.avg_tokens_per_turn * 2
+        recent = sorted(self.turn_token_history[-20:])
+        idx = int(len(recent) * 0.9)
+        return recent[idx]
+    
+    def max_summary_tokens(self, recent_raw_tokens: int = 6000) -> int:
+        """Calculate how large the summary can be while leaving headroom."""
+        headroom = self.p90_tokens_per_turn * self.checkpoint_interval * self.safety_margin
+        available = self.context_budget - self.system_tokens - headroom - recent_raw_tokens
+        # Floor: summary should be at least 2K tokens to be useful
+        # Ceiling: summaries over 30K start degrading lower model attention
+        return max(2000, min(30000, int(available)))
+```
+
+#### Emergency Compression Triggers
+
+Beyond scheduled checkpoints, compression can fire early:
+
+1. **Context budget alert:** lower model's context usage exceeds 70% of budget → trigger early checkpoint
+2. **`ask_upper` with type=distill:** lower model explicitly requests compression
+3. **Router context_size trigger:** router sees context growing too large → triggers compression before routing decision
+4. **Turn token spike:** single turn adds > 3× the average (huge code dump) → consider early compression
+
+```python
+def should_emergency_compress(self) -> bool:
+    """Check if we need an unscheduled compression."""
+    current_usage = self.current_context_tokens / self.context_budget
+    if current_usage > 0.70:
+        return True
+    if self.last_turn_tokens > self.p90_tokens_per_turn * 3:
+        return True
+    return False
+```
+
 #### Compression Budget
 
 Each compression costs:
-- Input: ~10 turns × ~1000 tok/turn = ~10K tokens
-- Output: ~2-3K tokens (the summary)
+- Input: ~10 turns × ~1000 tok/turn = ~10K tokens (+ previous summary ~3K)
+- Output: ~2-3K tokens (the differential update)
 - Cost: ~$0.20 per checkpoint on Opus
 
 Combined with the oversight review (which reads the same context), total per-checkpoint cost: **~$0.20** (the context is read once for both review + compression).
