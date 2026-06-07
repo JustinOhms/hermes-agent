@@ -1095,6 +1095,100 @@ USER_RETURNS → [slow model handles turn 1]
 
 For v2, preloading two models simultaneously (if RAM permits) eliminates swap latency entirely. With 128 GB: Coder-Next (61 GB) + little-qwen (22 GB) = 83 GB leaves 45 GB for system — tight but feasible on separate ports.
 
+### RD-17: Cost-aware routing filter (anti-thrashing)
+**Resolved 2026-06-06:** The routing system uses a two-dimensional cost model as a secondary gate after complexity/mode classification. The router's recommendation is an *ideal* — the cost filter decides whether acting on it is *worth it* given the economics of the transition.
+
+**Two cost axes per graph position:**
+
+1. **Per-turn cost** — the marginal cost of a single inference call on this model.
+   - Local model (running): 0 (compute is already paid for via hardware)
+   - Local model (not running): 0 per-turn, but see transition cost
+   - Cloud model: f(input_tokens, output_tokens, price_per_1k) — configured per position
+
+2. **Transition cost** — the cost of *getting to* this model from the current state.
+   - Cloud model: 0 (always available, no startup)
+   - Local model already loaded on :58080: 0 (just point the agent at it)
+   - Local model NOT loaded: HIGH (8-17s wall clock, RAM churn, user waiting)
+   - Conceptually a scalar that combines time-cost and disruption-cost
+
+**Decision logic:** The cost filter runs after the Turn Router selects a target position but before `execute_routing_swap()` commits to the transition:
+
+```
+routing_benefit = quality_delta(target) - quality_delta(current)
+routing_cost = transition_cost(target) + per_turn_cost(target) × expected_turns
+stay_cost = per_turn_cost(current) × expected_turns
+
+if routing_benefit > (routing_cost - stay_cost):
+    approve_swap()
+else:
+    stay_on_current()
+```
+
+The `expected_turns` estimate uses **consecutive-target-agreement** as a confidence multiplier: if the router has recommended the same target for N consecutive turns, confidence that we'll stay there goes up. First turn it says "escalate" → cost filter may say "wait one more turn." Third turn in a row → commit.
+
+**Concrete scenarios:**
+
+- **Scenario A: Escalate to Opus.** Per-turn cost = ~$0.03. Transition cost = 0 (cloud, always available). Current model is local (per-turn cost = 0). Question: is the complexity delta worth $0.03/turn? For genuinely hard tasks (complexity > 0.8), yes — approve immediately. For borderline messages (complexity 0.72), the cost filter may wait for a second consecutive high-complexity turn before committing.
+
+- **Scenario B: De-escalate to little-qwen (fast fallback).** Per-turn cost = 0. Transition cost = HIGH (must `llm start little-qwen`, unloading coder-next — 12s disruption). Current model handles the message fine, just slightly overkill. Cost filter rejects: transition cost vastly exceeds the zero per-turn savings. Only approved if the router has been recommending de-escalation for 5+ consecutive turns (sustained trivial workload).
+
+- **Scenario C: Return to interactive_lower (coder-next) from Opus.** Per-turn cost goes from ~$0.03 → 0. Transition cost = 0 (coder-next already loaded on :58080). Clear win — every turn we stay on Opus costs money, switching to local costs nothing. Cost filter approves immediately.
+
+- **Scenario D: Complexity oscillation.** Messages alternate between 0.65 and 0.75 complexity (straddling the 0.7 threshold). Router flip-flops between interactive_lower and upper. Cost filter sees no consecutive-target-agreement — never reaches confidence threshold. Result: stays on current model, oscillation absorbed.
+
+**Key properties:**
+
+- **Local↔cloud transitions are cheap** — cloud is always available, local stays warm on :58080. These transitions are approved with minimal friction.
+- **Local↔local transitions are expensive** — only one model fits on :58080. These require strong, sustained routing signals before approval.
+- **Escalation bias** — the cost filter can have asymmetric thresholds: escalation (safety/quality) requires less confidence than de-escalation (optimization). Spending $0.03 on a turn that *might* need Opus is cheaper than a compounding error.
+- **Natural debounce** — the consecutive-target-agreement requirement means single-turn spikes ("thanks" between complex requests) never trigger swaps. The cost filter absorbs transient noise without explicit cooldown timers.
+
+**Config schema extension:**
+
+```yaml
+model:
+  routing:
+    graph:
+      interactive_lower:
+        provider: "custom:llm-local"
+        model: "qwen3-coder-next"
+        llm_config_name: "coder-next"
+        cost:
+          per_1k_input_tokens: 0
+          per_1k_output_tokens: 0
+          transition_cold: 100    # scalar: high cost to cold-start
+          transition_warm: 0      # already loaded
+      upper:
+        provider: "bedrock"
+        model: "us.anthropic.claude-opus-4-6-v1"
+        cost:
+          per_1k_input_tokens: 15
+          per_1k_output_tokens: 75
+          transition_cold: 0      # always available
+          transition_warm: 0
+      fast_fallback:
+        provider: "custom:llm-local"
+        model: "qwen3-coder-30b"
+        llm_config_name: "little-qwen"
+        cost:
+          per_1k_input_tokens: 0
+          per_1k_output_tokens: 0
+          transition_cold: 100    # requires llm start (unloads current)
+          transition_warm: 0
+    cost_filter:
+      enabled: true
+      min_consecutive_agreement: 2    # turns router must agree before approving
+      escalation_override: true       # bypass cost filter for upper (safety)
+      cold_swap_min_agreement: 5      # local↔local needs strong signal
+```
+
+**Bypass conditions** — the cost filter is skipped when:
+- Explicit user override (`/routing swap <position>`, `/mode autonomous`)
+- `escalation_override: true` and target is upper (quality/safety trumps cost)
+- Current model is unreachable (failover, not routing)
+
+**Implementation phase:** Phase 5 (after the routing system is validated end-to-end with manual tuning). The cost filter adds optimization sophistication on top of a working system — it should not gate initial deployment.
+
 ### Future Graph Expansion (v2+)
 
 ```
