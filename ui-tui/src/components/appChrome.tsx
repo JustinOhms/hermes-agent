@@ -398,6 +398,8 @@ export function StatusRule({
   modelReasoningEffort,
   indicatorStyle = 'kaomoji',
   notice,
+  routingPosition,
+  routingSwapState,
   usage,
   bgCount,
   liveSessionCount,
@@ -548,6 +550,11 @@ export function StatusRule({
             {' │ '}
             {modelText}
           </Text>
+          {routingPosition ? (
+            <Text color={routingSwapState === 'SWAPPING' ? t.color.warn : t.color.muted} wrap="truncate-end">
+              {' · '}{routingSwapState === 'SWAPPING' ? '🔄' : '⚡'}{routingPosition}
+            </Text>
+          ) : null}
           {ctxLabel ? (
             <Text color={t.color.muted} wrap="truncate-end">
               {' │ '}
@@ -734,6 +741,8 @@ interface StatusRuleProps {
   modelReasoningEffort?: string
   indicatorStyle?: IndicatorStyle
   notice?: Notice | null
+  routingPosition?: null | string
+  routingSwapState?: null | string
   sessionStartedAt?: null | number
   showCost: boolean
   status: string

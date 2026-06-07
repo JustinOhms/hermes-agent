@@ -152,6 +152,12 @@ export interface SessionInfo {
   profile_name?: string
   reasoning_effort?: string
   release_date?: string
+  routing?: {
+    enabled: boolean
+    mode: string
+    position: string | null
+    swap_state: string
+  } | null
   service_tier?: string
   skills: Record<string, string[]>
   slot?: string
