@@ -131,8 +131,16 @@ COMMAND_REGISTRY: list[CommandDef] = [
     # Configuration
     CommandDef("config", "Show current configuration", "Configuration",
                cli_only=True),
+<<<<<<< HEAD
     CommandDef("model", "Switch model (persists by default)", "Configuration",
                args_hint="[model] [--provider name] [--global|--session] [--refresh]"),
+=======
+    CommandDef("model", "Switch model for this session", "Configuration",
+               args_hint="[model] [--provider name] [--global] [--refresh]"),
+    CommandDef("routing", "Model routing status and control", "Configuration",
+               args_hint="[status|graph|swap|mode|history]",
+               subcommands=("status", "graph", "swap", "mode", "history")),
+>>>>>>> fbc6425d9 (feat(routing): Phase 3b — /routing command + TUI indicator)
     CommandDef("codex-runtime", "Toggle codex app-server runtime for OpenAI/Codex models",
                "Configuration", aliases=("codex_runtime",),
                args_hint="[auto|codex_app_server]"),

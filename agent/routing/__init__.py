@@ -2,12 +2,17 @@
 
 Phase 1: decision-only (log but no swap).
 Phase 2: swap execution via SwapManager + ModelResolver.
+Phase 3b: decision history ring buffer + state aggregation (get_routing_state).
 """
 
 from __future__ import annotations
 
 import logging
+import time
+from collections import deque
 from typing import Optional
+
+from agent.routing.state import get_routing_state  # noqa: F401 — re-exported
 
 from agent.routing.config import RoutingConfig, load_routing_config
 from agent.routing.interaction_mode import InteractionMode, InteractionModeDetector
@@ -64,6 +69,17 @@ def get_routing_decision(agent: object, user_message: str) -> Optional[RoutingDe
                             decision.swap_required = True
         except Exception as exc:
             logger.debug("swap_required check failed (non-fatal): %s", exc)
+
+        # ── Phase 3b: append to per-session decision history ring buffer ──
+        try:
+            history = getattr(agent, "_routing_decision_history", None)
+            if history is None:
+                history = deque(maxlen=20)
+                setattr(agent, "_routing_decision_history", history)
+            decision._timestamp = time.time()
+            history.append(decision)
+        except Exception:
+            pass
 
         return decision
 
