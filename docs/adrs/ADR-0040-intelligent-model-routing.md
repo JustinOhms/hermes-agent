@@ -1087,6 +1087,12 @@ USER_RETURNS → [slow model handles turn 1]
 - If local model fails to load within 30s: cloud model stays active, warns user, logs diagnostic
 - If user stops interacting during swap: abort swap, stay on current model (the trigger was wrong)
 
+**Dependency on model profiling (RD-14):** The swap orchestrator relies on profiled startup latency to make informed decisions:
+- **Swap budget calculation:** If profiled startup for Coder-Next is 17s, the orchestrator knows to budget ~20s (with margin) before declaring failure
+- **Out-of-bounds detection:** If a swap that normally takes 17s is taking 40s, something is wrong (disk pressure, RAM contention, corrupt model file). The orchestrator can abort early and stay on cloud rather than waiting blindly.
+- **Graph placement constraint:** A model with 45s startup latency is unsuitable for the "interactive lower" role even if its tok/s is excellent — the swap cost makes mode transitions too painful. The placement system accounts for this.
+- **Cloud TTFT monitoring:** If the cloud model's observed TTFT exceeds its profiled p90 (e.g., Bedrock is having a bad day), the orchestrator may decide the "slow local model" is actually faster right now and skip the cloud-orchestrated swap entirely.
+
 For v2, preloading two models simultaneously (if RAM permits) eliminates swap latency entirely. With 128 GB: Coder-Next (61 GB) + little-qwen (22 GB) = 83 GB leaves 45 GB for system — tight but feasible on separate ports.
 
 ### Future Graph Expansion (v2+)
@@ -1269,15 +1275,23 @@ The capability database is shipped with Hermes and updated with new model releas
 ### RD-14: Model-agnostic graph — separate evaluation and placement system
 **Resolved 2026-06-06:** The routing architecture is completely model-agnostic. The capability graph defines **roles** (interactive lower, autonomous lower, fast fallback, upper/oversight) — not specific models. Which models fill which roles is determined by a separate **model evaluation and placement system** that:
 
-1. **Benchmarks available models** — measures tok/s (prompt + generation), tool-calling reliability, reasoning quality on standard tasks, context window handling
+1. **Benchmarks available models** — measures:
+   - Generation speed: tok/s (prompt processing + generation)
+   - Tool-calling reliability: % of well-formed function calls
+   - Reasoning quality: score on standard reasoning tasks
+   - Context window handling: quality degradation at various fill levels
+   - **Startup latency:** time from "swap requested" to "first token available" (local: model load time; cloud: network TTFT)
+   - **Time-to-first-token (TTFT):** measured p50/p90/p99 across typical prompt sizes
+   - **Model locality:** local (on-device, requires RAM + load time) vs. cloud (network-dependent, instant availability)
 2. **Profiles hardware constraints** — available RAM, bandwidth ceiling, max concurrent models
 3. **Calculates cost curves** — per-token API costs, amortized local compute, energy
 4. **Places models into graph positions** — optimizes for the routing system's requirements:
-   - Interactive lower: must exceed a latency floor (e.g., >20 tok/s)
+   - Interactive lower: must exceed a latency floor (e.g., >20 tok/s) AND startup latency < swap budget
    - Autonomous lower: must exceed a quality floor (reasoning benchmark threshold)
-   - Fast fallback: must exceed a speed floor (e.g., >100 tok/s)
-   - Upper: must exceed a capability ceiling (hardest tasks, compression quality)
+   - Fast fallback: must exceed a speed floor (e.g., >100 tok/s) AND lowest startup latency among local models
+   - Upper: must exceed a capability ceiling (hardest tasks, compression quality) AND TTFT within cloud SLA
 5. **Re-evaluates on model additions** — when a new model is downloaded, a new provider configured, or a model is enabled/disabled in config, re-runs placement to see if the graph should change
+6. **Monitors runtime drift** — continuously compares observed TTFT/tok/s against profiled baselines. When metrics exceed expected bounds (e.g., TTFT p90 > 2× profiled value), flags degradation and may trigger re-evaluation or failover
 
 This is a **Phase 5+** system, built after the routing architecture is validated. For v1, graph positions are manually configured (the current Target Model Lineup). RD-13's `/routing setup` is the user-facing wrapper for this system.
 
