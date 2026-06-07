@@ -874,7 +874,7 @@ For v1, we implement the two-node case. The data structures support N nodes from
 ## Remaining Open Questions
 
 1. **`ask_upper` tool budget:** Should the lower model have unlimited access to `ask_upper`, or should there be a per-session cap to prevent cost explosion?
-   - Leaning: soft budget (warning after N calls) rather than hard cap
+   - Leaning: **token budget** (cumulative input+output tokens tracked against a dollar threshold, not call count)
 
 2. **Handback prompt authoring:** Should the upper model's handback prompt be structured (template + fields) or freeform?
    - Leaning: structured template with sections (summary, active files, current task, guidance)
@@ -883,10 +883,51 @@ For v1, we implement the two-node case. The data structures support N nodes from
    - Leaning: for v1, there's only one upper. For vN, select based on capability match to the question type.
 
 4. **Compression fidelity:** How do we verify the compression didn't lose critical context?
-   - Leaning: upper model includes a `key_facts` list that the lower model can reference; if the lower model seems confused, oversight catches it next cycle
+   - Leaning: Full calibration pass every 5th checkpoint re-reads raw history from disk. Plus: append-only "key decisions" section never trimmed.
 
 5. **How does this interact with `delegate_task`?** Subagents have their own model config — should they inherit routing?
    - Leaning: subagents use `delegation.model` as today; routing is session-level only
 
 6. **Should the routing config be part of a profile?** So you can have `hermes -p local` (routing on) and `hermes -p opus` (always Opus)?
    - Leaning: yes, naturally — each profile has its own config.yaml
+
+7. **30K summary ceiling:** Is this empirically validated for Qwen3-Coder-Next? Does it degrade with long system messages?
+   - Needs testing: validate attention quality at various summary sizes during model benchmarking
+
+8. **Prompt caching interaction:** Compression rebuilds `self.messages` every N turns, breaking any cached prefix. Is this cost-significant?
+   - Likely acceptable: compression happens infrequently (every 10 turns), and the cost savings from routing overwhelm the cache miss penalty. But should be measured.
+
+---
+
+## Resolved Decisions (continued)
+
+### RD-9: Fallback chain for upper model unreachable
+**Resolved 2026-06-06:** Each level in the capability graph has a designated fallback chain when its upper model is unreachable:
+
+1. Retry with exponential backoff (3 attempts)
+2. Try alternate upper model if configured (e.g., Sonnet as fallback for Opus)
+3. Skip checkpoint — continue with stale context, retry at next natural break
+4. If context at emergency levels (>85%): naive truncation (drop oldest non-system messages)
+5. If all else fails: halt and notify user
+
+For `ask_upper` specifically: return a structured error ("Upper model unavailable, proceed with best judgment"). The lower model already handles failed tool calls gracefully.
+
+The philosophy: graceful degradation first, halt only as last resort. The system should never silently lose data — either compress properly or stop and tell the user.
+
+### RD-10: Full calibration to prevent compression drift
+**Resolved 2026-06-06:** Every 5th oversight checkpoint (configurable), the upper model re-reads the full raw session history from the SQLite message store (not from the in-memory compressed summary) and produces a fresh summary from ground truth.
+
+This prevents the "telephone game" failure where summaries-of-summaries drift from reality over many checkpoints. Most sessions' raw history fits within the upper model's 200K context window. For sessions exceeding 200K raw tokens: progressive summarization (chunk → summarize → combine).
+
+### RD-11: Auto-configuration via `/routing setup`
+**Resolved 2026-06-06:** The routing system must be configurable without writing YAML. A `/routing setup` slash command:
+
+1. Discovers all configured models (scan config.yaml, ping local endpoints)
+2. Classifies each model (built-in capability database for known models, user prompt for unknowns)
+3. Constructs a proposed capability graph (sort by cost tier, infer upper/lower relationships)
+4. Presents the graph to the user for approval
+5. On accept: writes config to config.yaml
+
+This means the entire routing feature can be enabled by typing `/routing setup` and pressing Accept. The system does the work of figuring out which models should be upper/lower, where oversight belongs, and what thresholds make sense.
+
+The capability database is shipped with Hermes and updated with new model releases. For unknown models (user's custom fine-tunes, new releases), the system can either ask the user or run a brief capability probe (a few test prompts to gauge reasoning depth and tool-calling reliability).
