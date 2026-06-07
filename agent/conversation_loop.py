@@ -429,6 +429,26 @@ def run_conversation(
     # No-op when _fallback_activated is False (gateway, first turn, etc.).
     agent._restore_primary_runtime()
 
+    # ── Model routing decision (Phase 1: decision-only, no swap) ──
+    routing_decision = None
+    try:
+        from hermes_cli.config import cfg_get, load_config as _load_routing_cfg
+        _routing_cfg = _load_routing_cfg()
+        if cfg_get(_routing_cfg, "model", "routing", "enabled"):
+            from agent.routing import get_routing_decision
+            routing_decision = get_routing_decision(agent, user_message)
+            if routing_decision:
+                logger.info(
+                    "routing_decision: target=%s complexity=%.2f mode=%s reason=%s swap_required=%s",
+                    routing_decision.target_position,
+                    routing_decision.complexity_score,
+                    routing_decision.interaction_mode.value,
+                    routing_decision.reason,
+                    routing_decision.swap_required,
+                )
+    except Exception:
+        pass
+
     # Sanitize surrogate characters from user input.  Clipboard paste from
     # rich-text editors (Google Docs, Word, etc.) can inject lone surrogates
     # that are invalid UTF-8 and crash JSON serialization in the OpenAI SDK.
