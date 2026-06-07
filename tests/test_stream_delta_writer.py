@@ -28,7 +28,7 @@ def writer_cls():
     import os
 
     # Add the tui_gateway parent to path
-    hermes_root = os.path.expanduser("~/.hermes/hermes-agent")
+    hermes_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if hermes_root not in sys.path:
         sys.path.insert(0, hermes_root)
 
