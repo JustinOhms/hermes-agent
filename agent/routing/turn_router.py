@@ -220,5 +220,10 @@ class TurnRouter:
         return result
 
     def _swap_required(self, target: str) -> bool:
-        """Phase 1: always False — swap detection is Phase 2."""
+        """Phase 1 stub — always False.
+
+        Phase 2 swap_required logic lives in agent/routing/__init__.py:
+        get_routing_decision() updates the flag after comparing target vs.
+        the current SwapManager position.
+        """
         return False

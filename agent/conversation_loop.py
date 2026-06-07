@@ -429,7 +429,7 @@ def run_conversation(
     # No-op when _fallback_activated is False (gateway, first turn, etc.).
     agent._restore_primary_runtime()
 
-    # ── Model routing decision (Phase 1: decision-only, no swap) ──
+    # ── Model routing: Phase 1 decision + Phase 2 swap execution ──
     routing_decision = None
     try:
         from hermes_cli.config import cfg_get, load_config as _load_routing_cfg
@@ -448,6 +448,33 @@ def run_conversation(
                 )
     except Exception:
         pass
+
+    # ── Model routing: Phase 2 — execute swaps ──
+    if routing_decision and routing_decision.swap_required:
+        try:
+            from agent.routing import execute_routing_swap
+            from agent.agent_runtime_helpers import switch_model as _routing_switch_model
+            _effective = execute_routing_swap(agent, routing_decision)
+            if _effective and (
+                _effective.provider != agent.provider
+                or _effective.model != agent.model
+            ):
+                _routing_switch_model(
+                    agent,
+                    new_model=_effective.model,
+                    new_provider=_effective.provider,
+                    api_key=_effective.api_key,
+                    base_url=_effective.base_url,
+                    api_mode=_effective.api_mode,
+                )
+                logger.info(
+                    "routing_swap: %s → %s (%s)",
+                    routing_decision.target_position,
+                    _effective.model,
+                    _effective.provider,
+                )
+        except Exception:
+            pass
 
     # Sanitize surrogate characters from user input.  Clipboard paste from
     # rich-text editors (Google Docs, Word, etc.) can inject lone surrogates
