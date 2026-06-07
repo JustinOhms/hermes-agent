@@ -22,6 +22,10 @@ class GraphPosition:
     provider: str = ""
     model: str = ""
     profile: GraphPositionProfile = field(default_factory=GraphPositionProfile)
+    base_url: str = ""
+    api_mode: str = ""
+    api_key: str = ""
+    llm_config_name: str = ""  # name for `llm start <name>`; set for local models
 
 
 @dataclass
@@ -70,6 +74,10 @@ def _parse_graph(raw: Dict[str, Any]) -> Dict[str, GraphPosition]:
             provider=str(pos_raw.get("provider", "")),
             model=str(pos_raw.get("model", "")),
             profile=profile,
+            base_url=str(pos_raw.get("base_url", "")),
+            api_mode=str(pos_raw.get("api_mode", "")),
+            api_key=str(pos_raw.get("api_key", "")),
+            llm_config_name=str(pos_raw.get("llm_config_name", "")),
         )
     return positions
 
