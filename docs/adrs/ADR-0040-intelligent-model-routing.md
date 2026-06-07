@@ -910,9 +910,9 @@ Combined with the oversight review (which reads the same context), total per-che
 
 ## Target Model Lineup (v1 Validation)
 
-The initial implementation targets this specific two-node graph for validation:
+The initial implementation targets a four-node capability graph with measured benchmarks from M5 Max 128 GB hardware.
 
-### Lower Model: Qwen3-Coder-Next (Q4_K_M)
+### Interactive Lower Model: Qwen3-Coder-Next (Q4_K_M)
 
 | Property | Value |
 |----------|-------|
@@ -921,11 +921,41 @@ The initial implementation targets this specific two-node graph for validation:
 | Context window | 262,144 tokens (native, no RoPE hacks) |
 | KV cache | 2 heads × 128 dim × 80 layers = tiny; Q8_0 at 262K ≈ 6 GB |
 | Total RAM | ~61 GB (weights + KV + overhead) |
-| Inference speed | ~15-25 tok/s on M5 Max (3B active params, memory-bandwidth bound) |
-| Strengths | Code generation, tool calling, instruction following |
+| **Measured speed** | **Prompt: 376–720 tok/s, Generation: 32–38 tok/s** |
+| Strengths | Code generation, tool calling, instruction following, deep expert routing |
 | Weaknesses | Complex multi-step reasoning, architecture decisions, long-horizon planning |
 | llama-server flags | `--flash-attn --cache-type-k q8_0 --cache-type-v q8_0 -c 262144 -ngl 99` |
 | Provider config | `custom` provider, `http://127.0.0.1:58080/v1`, `sk-local` |
+| **Role** | Primary interactive workhorse. Handles routine work when user is present. |
+
+### Autonomous Lower Model: Qwen3.6-27B-UD (Q4_K_XL)
+
+| Property | Value |
+|----------|-------|
+| Architecture | 27B dense, hybrid attention (16/64 layers full KV) |
+| Quantization | Q4_K_XL (16 GB on disk) |
+| Context window | 262,144 tokens |
+| Total RAM | ~25 GB (weights + KV + overhead) |
+| **Measured speed** | **Prompt: 148–199 tok/s, Generation: 6.3–6.9 tok/s** |
+| Strengths | Dense all-parameter reasoning, prose quality, nuanced understanding |
+| Weaknesses | Too slow for interactive use (6 tok/s feels glacial) |
+| llama-server flags | `--flash-attn --cache-type-k q8_0 --cache-type-v q8_0 -c 262144 -ngl 99` |
+| Provider config | `custom` provider, `http://127.0.0.1:58080/v1`, `sk-local` |
+| **Role** | Overnight/cron/subagent workhorse. Higher quality reasoning when latency is invisible. |
+
+### Fast Fallback Model: Qwen3-Coder-30B-A3B (Q4_K_M)
+
+| Property | Value |
+|----------|-------|
+| Architecture | 30B MoE, 3B active parameters per token |
+| Quantization | Q4_K_M (17 GB on disk) |
+| Context window | 131,072 tokens |
+| Total RAM | ~22 GB (weights + KV + overhead) |
+| **Measured speed** | **Generation: ~139 tok/s** |
+| Strengths | Blazing fast, proven reliability, small footprint |
+| Weaknesses | Smaller expert pool than Coder-Next, shorter context window |
+| Provider config | `custom` provider, `http://127.0.0.1:58080/v1`, `sk-local` |
+| **Role** | De-escalation target. When even Coder-Next is more model than needed. |
 
 ### Upper Model: Claude Opus 4.6
 
@@ -937,27 +967,92 @@ The initial implementation targets this specific two-node graph for validation:
 | Strengths | Complex reasoning, architecture, planning, summarization, oversight |
 | Weaknesses | Cost, latency (~5-15s for complex turns) |
 | Provider config | `bedrock`, `us.anthropic.claude-opus-4-6-v1` |
+| **Role** | Escalation target, oversight, compression, mentor (ask_upper). |
 
-### Capability Graph (v1)
+### Capability Graph (v1) — Bidirectional
 
 ```
-┌──────────────────────────────────────┐
-│  Claude Opus 4.6 (upper)             │
-│  200K ctx │ $15/$75 per M │ 5-15s    │
-│  Roles: oversight, mentor, escalation│
-│          compression, handback       │
-└──────────────────┬───────────────────┘
-                   │ upper_of
-                   │ (escalation triggers, handback protocol,
-                   │  compression targeting, mentor tool)
-                   │
-┌──────────────────┴───────────────────┐
-│  Qwen3-Coder-Next Q4_K_M (lower)    │
-│  262K ctx │ $0 │ 15-25 tok/s         │
-│  Roles: primary workhorse, routine   │
-│          tool: ask_upper             │
-└──────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  Claude Opus 4.6 (upper)                                     │
+│  200K ctx │ $15/$75 per M │ 5-15s                            │
+│  Roles: oversight, mentor, escalation, compression, handback │
+└────────────────────────────┬─────────────────────────────────┘
+                             │ upper_of (escalation ↑)
+                             │
+┌────────────────────────────┴─────────────────────────────────┐
+│  Qwen3-Coder-Next 80B MoE (interactive lower)               │
+│  262K ctx │ $0 │ 33 tok/s                                    │
+│  Roles: primary interactive workhorse, tool: ask_upper       │
+├──────────────────────────────────────────────────────────────┤
+│      ↕ mode switch (interaction mode detector)               │
+├──────────────────────────────────────────────────────────────┤
+│  Qwen3.6-27B dense (autonomous lower)                       │
+│  262K ctx │ $0 │ 6.5 tok/s                                   │
+│  Roles: overnight/cron workhorse, tool: ask_upper            │
+└────────────────────────────┬─────────────────────────────────┘
+                             │ lower_of (de-escalation ↓)
+                             │
+┌────────────────────────────┴─────────────────────────────────┐
+│  little-qwen 30B MoE (fast fallback)                         │
+│  131K ctx │ $0 │ 139 tok/s                                   │
+│  Roles: rapid-fire, trivial tasks, speed-critical bursts     │
+└──────────────────────────────────────────────────────────────┘
 ```
+
+### De-escalation: The Downward Edge
+
+Escalation moves **up** the graph when work is too complex for the current model. De-escalation is the inverse — moving **down** when the current model is more capability than needed and speed becomes the bottleneck.
+
+**When de-escalation fires:**
+- Rapid-fire trivial exchanges (user sending many short messages in quick succession)
+- Simple acknowledgments, confirmations, status checks
+- Tool-only turns (the model just needs to call `read_file` or `terminal`, no reasoning)
+- The primary model is loaded/slow (e.g., long KV cache, high context) and a lighter model could respond instantly
+
+**The symmetry:**
+
+| Direction | Trigger | Trades | Example |
+|-----------|---------|--------|---------|
+| **Escalate ↑** | Complexity exceeds capability | Speed/cost → quality | "Debug this race condition" → Opus |
+| **De-escalate ↓** | Task is trivially below capability | Quality → speed | "What branch am I on?" → little-qwen |
+
+De-escalation is conservative by default — most routine turns stay on the primary lower model (Coder-Next). It only drops to the fast fallback when speed is critical *and* the task is genuinely trivial. The fast fallback never has `ask_upper` access (it's too light to be a mentor relationship) and doesn't receive oversight (too transient to be worth reviewing).
+
+**Config:**
+
+```yaml
+model:
+  routing:
+    de_escalation:
+      enabled: true
+      model: qwen3-coder-30b-moe         # fast fallback
+      provider: custom
+      triggers:
+        message_length_below: 50          # very short user messages
+        rapid_fire_threshold: 3           # N messages within rapid_fire_window
+        rapid_fire_window: 30             # seconds
+        tool_only_pattern: true           # turns that are pure tool dispatch
+      # De-escalation is never sticky — re-evaluates every turn
+      sticky: false
+```
+
+### Model Swap Mechanics
+
+Only one local model runs at a time on `:58080`. Mode/model transitions require a server swap:
+
+| Transition | Trigger | Server Action | Latency |
+|------------|---------|---------------|---------|
+| interactive → autonomous | User idle 10 min | `llm start prose` (Qwen3.6-27B) | ~10-15s |
+| autonomous → interactive | User message arrives | `llm start coder-next` | ~17s |
+| primary → fast fallback | De-escalation fires | `llm start little-qwen` | ~8s |
+| fast fallback → primary | Non-trivial message | `llm start coder-next` | ~17s |
+
+The swap latency (8-17s) is acceptable for mode transitions because:
+- **interactive → autonomous:** user is already gone, no one is waiting
+- **autonomous → interactive:** the *first* response back can go to Opus (cloud, instant) while the local model loads in the background
+- **primary ↔ fast fallback:** these are rare edge cases; the 8s swap for little-qwen is fast enough
+
+For v2, preloading two models simultaneously (if RAM permits) eliminates swap latency entirely. With 128 GB: Coder-Next (61 GB) + little-qwen (22 GB) = 83 GB leaves 45 GB for system — tight but feasible on separate ports.
 
 ### Future Graph Expansion (v2+)
 
@@ -974,17 +1069,23 @@ The initial implementation targets this specific two-node graph for validation:
      │                     │
 ┌────┴─────┐         ┌────┴─────┐
 │  Coder   │         │ Qwen3.6  │  (local specialists)
-│  Next    │         │   27B    │
+│  Next    │◄───────►│   27B    │  (mode-switched, same port)
 │  (code)  │         │  (prose) │
-└──────────┘         └──────────┘
+└────┬─────┘         └──────────┘
+     │ lower_of
+┌────┴─────┐
+│  little- │  (fast fallback, de-escalation)
+│  qwen    │
+└──────────┘
 ```
 
 In the expanded graph:
-- Coder-Next handles code tasks, Qwen3.6-27B handles prose/research
+- Coder-Next handles code tasks, Qwen3.6-27B handles prose/research (mode-switched)
 - Either can escalate to Sonnet (fast cloud, cheaper than Opus)
 - Sonnet escalates to Opus only for the hardest problems
+- little-qwen sits below as the speed-optimized de-escalation target
 - Each edge has its own handoff protocol and compression parameters
-- The router selects both the tier AND the specialist within a tier
+- The router selects tier AND specialist AND speed class
 
 ---
 
@@ -1108,7 +1209,17 @@ Detection is automatic (platform signals, idle time, turn patterns) with explici
 
 This means Qwen3.6-27B has a clear role in the system despite being too slow for interactive use — it's the overnight workhorse. The capability graph gains a "mode" dimension: the same tier can have different model selections depending on whether anyone is waiting.
 
-### RD-12: Auto-configuration via `/routing setup`
+### RD-12: De-escalation — the downward edge
+**Resolved 2026-06-06:** The capability graph is bidirectional. Escalation moves up (complexity exceeds capability → stronger model). De-escalation moves *down* (task is trivially below capability → faster model). This is the symmetric inverse of oversight — shedding capability for speed when the workload is trivial rapid-fire.
+
+The fast fallback (little-qwen, 139 tok/s) handles:
+- Rapid-fire trivial exchanges (many short messages in quick succession)
+- Tool-only turns (pure dispatch, no reasoning needed)
+- Simple acknowledgments, status checks
+
+De-escalation is conservative (most routine work stays on the primary lower) and never sticky (re-evaluates every turn). The fast fallback has no `ask_upper` access and no oversight — it's too transient and too light for a mentor relationship.
+
+### RD-13: Auto-configuration via `/routing setup`
 **Resolved 2026-06-06:** The routing system must be configurable without writing YAML. A `/routing setup` slash command:
 
 1. Discovers all configured models (scan config.yaml, ping local endpoints)
