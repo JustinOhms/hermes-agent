@@ -172,6 +172,183 @@ model:
 
 ---
 
+### 1b. Interaction Mode — Latency vs. Quality Tradeoff
+
+#### The Insight
+
+The Turn Router classifies **what** to route. Interaction Mode classifies **when** — specifically, whether anyone is waiting for the response. This creates a second axis for model selection:
+
+- **Interactive mode:** User is present, conversational, expecting sub-second token streaming. Optimize for **latency** (tok/s). Use the fastest capable model.
+- **Autonomous mode:** No one is watching — overnight sessions, cron jobs, delegate_task subagents, deep non-interactive work. Optimize for **reasoning quality**. Latency is irrelevant; a 30-second dense-model response that's smarter is strictly better.
+
+This resolves the "Qwen3.6-27B is too slow" problem: it's too slow *interactively* (6 tok/s), but for autonomous work it's fine — and its denser architecture may produce better reasoning than a faster MoE with 3B active parameters.
+
+#### Model Selection Matrix
+
+| Interaction Mode | Complexity Tier | Selected Model | Rationale |
+|------------------|-----------------|----------------|-----------|
+| `interactive` | `routine` | little-qwen (MoE, 139 tok/s) | Fast + free, user waiting |
+| `interactive` | `complex` | Opus (cloud) | User waiting, quality needed |
+| `autonomous` | `routine` | Qwen3.6-27B (dense, 6 tok/s) | Quality > speed, nobody watching |
+| `autonomous` | `complex` | Opus (cloud) | Hardest problems still escalate |
+
+The interaction mode doesn't replace complexity classification — it **modulates the lower model selection**. Complex work still goes to the upper model regardless of mode. But for routine/moderate work, autonomous mode prefers a smarter-but-slower model because the latency penalty is invisible.
+
+#### Detection Heuristics (automatic, no explicit mode switch)
+
+```python
+class InteractionModeDetector:
+    """Classifies the current session's interaction mode."""
+    
+    def classify(self, context: RoutingContext) -> InteractionMode:
+        # 1. Platform signals (highest confidence)
+        if context.platform == "cron":
+            return InteractionMode.AUTONOMOUS
+        if context.is_subagent:  # delegate_task child
+            return InteractionMode.AUTONOMOUS
+        
+        # 2. Skill signals
+        if "autonomous-overnight-work" in context.loaded_skills:
+            return InteractionMode.AUTONOMOUS
+        
+        # 3. Temporal signals (progressive detection)
+        time_since_last_user_msg = now() - context.last_user_message_time
+        if time_since_last_user_msg > self.config.autonomous_threshold:
+            return InteractionMode.AUTONOMOUS
+        
+        # 4. Session continuity patterns
+        if context.consecutive_agent_turns > self.config.unattended_turn_count:
+            # Agent has been working alone for many turns — user likely away
+            return InteractionMode.AUTONOMOUS
+        
+        # 5. Explicit user signals (override)
+        if context.user_declared_mode:
+            return context.user_declared_mode
+        
+        return InteractionMode.INTERACTIVE
+```
+
+#### Temporal Detection: The "Dropoff" Pattern
+
+The most common case: user is working interactively, then stops responding (goes to bed, steps away). The system should detect this transition and switch models:
+
+```
+User messages at: 10:01, 10:03, 10:05, 10:12, 10:15
+                                                      └─── 10:25 (no message for 10min)
+                                                            ↓
+                                                      Mode: INTERACTIVE → AUTONOMOUS
+                                                      Model: little-qwen → Qwen3.6-27B
+```
+
+**Transition rules:**
+- `interactive → autonomous`: After `autonomous_threshold` (default: 10 min) of no user messages, *if the agent has pending work*. If the session is idle (no pending work), no transition needed.
+- `autonomous → interactive`: **Immediately** on next user message. No delay — the user's back, swap to the fast model.
+
+The asymmetry is intentional: going autonomous is cautious (wait, confirm pattern), going interactive is instant (user is literally waiting right now).
+
+#### Config Shape
+
+```yaml
+model:
+  routing:
+    interaction_mode:
+      enabled: true
+      autonomous_threshold: 600         # seconds without user message → autonomous
+      unattended_turn_count: 5          # N agent turns without user → autonomous
+      transition_delay: 0               # seconds to wait before switching (0 = immediate)
+      
+      # Model overrides per mode (override the primary model selection)
+      interactive:
+        model: qwen3-coder-30b-moe      # fast MoE, 139 tok/s
+        provider: custom
+      autonomous:
+        model: qwen3.6-27b              # dense, 6 tok/s but smarter
+        provider: custom
+      
+      # Platform-based overrides (skip heuristics entirely)
+      platform_overrides:
+        cron: autonomous
+        delegate_task: autonomous
+```
+
+#### Interaction with Existing Router
+
+The interaction mode is evaluated **before** the complexity classifier:
+
+```
+User message → InteractionModeDetector.classify()
+                        │
+                        ├── INTERACTIVE → use interactive lower model pool
+                        │                    └── TurnRouter.classify() → ROUTINE or COMPLEX
+                        │
+                        └── AUTONOMOUS → use autonomous lower model pool  
+                                         └── TurnRouter.classify() → ROUTINE or COMPLEX
+```
+
+This means the complexity router's behavior is unchanged — it still escalates to the upper model for hard tasks. The interaction mode only affects which *lower* model handles routine work.
+
+#### Oversight Frequency Adaptation
+
+Autonomous mode also adjusts oversight parameters:
+
+| Parameter | Interactive | Autonomous | Rationale |
+|-----------|-------------|------------|-----------|
+| `oversight.every_n_turns` | 10 | 5 | Tighter review when unattended |
+| `oversight.max_reviews_per_session` | 5 | 20 | Longer sessions need more |
+| `oversight.actions.flag` | `notify_user` | `inject_and_continue` | User not watching; can't wait for them |
+| `compression.safety_margin` | 1.3 | 1.5 | More conservative when nobody monitors |
+
+When autonomous, the oversight model takes on greater responsibility — it can't flag and wait for a user who's asleep. Instead, it must decide: correct, escalate, or continue.
+
+#### User-Initiated Mode Override
+
+Sometimes the user knows they're about to step away:
+
+```
+User: "I'm heading out — keep working on this overnight"
+       └── Explicit signal: set mode = AUTONOMOUS immediately
+       └── Also loads autonomous-overnight-work skill behaviors
+```
+
+Or the inverse:
+
+```
+User: "I'm back, let me see what you've done"  
+       └── Implicit signal: any user message → INTERACTIVE (default)
+```
+
+TUI command for explicit control:
+
+```
+/mode autonomous    # Switch now (for deep non-interactive work while present)
+/mode interactive   # Switch back
+/mode auto          # Resume automatic detection (default)
+```
+
+#### Why This Matters for the Capability Graph
+
+In the v2+ expanded graph, interaction mode affects *which specialist* at each tier is selected:
+
+```
+                    ┌─────────────┐
+                    │   Opus 4.6  │  (always upper — mode doesn't affect upper selection)
+                    └──────┬──────┘
+                           │
+            ┌──────────────┼──────────────┐
+            │              │              │
+     INTERACTIVE      AUTONOMOUS     AUTONOMOUS
+     (routine)        (routine)      (complex)
+            │              │              │
+     ┌──────┴──────┐ ┌────┴─────┐       │
+     │  little-qwen│ │Qwen3.6   │       │
+     │  MoE 139t/s│ │27B 6t/s  │       Opus
+     └─────────────┘ └──────────┘
+```
+
+The interaction mode is not a property of a model — it's a property of the *session*. The model selection responds to it, but the models themselves are mode-agnostic.
+
+---
+
 ### 2. Failure Escalation (Enhanced)
 
 Extends the existing `_try_activate_fallback()` mechanism with smarter triggers.
@@ -725,6 +902,9 @@ Combined with the oversight review (which reads the same context), total per-che
 | Compression loses critical context | Lower model confused after handback | Differential compression preserves key decisions; lower model has `ask_upper(type=distill)` as escape hatch; oversight catches confusion at next checkpoint |
 | `ask_upper` cost explosion | Lower model over-relies on upper | Soft budget with warning after N calls; upper model's mentor prompt encourages independence |
 | Adaptive budget miscalculates | Summary too large (no headroom) or too small (lost context) | p90 with 1.3× safety margin is conservative; emergency compression at 70% as backstop |
+| Mode transition mid-work | Model switches from fast MoE to dense (or vice versa) mid-task | Transitions only fire at turn boundaries; in-progress inference completes on current model. Handoff context ensures continuity. |
+| False autonomous detection | Agent misreads a brief user pause as "gone for the night" | 10-min threshold is conservative; requires pending work; instant snap-back on user message. Tunable + `/mode` override. |
+| Dense model quality assumption | Qwen3.6-27B may not reason better than MoE for all task types | Validate empirically in Phase 1 benchmarking. Architecture is model-agnostic — swap autonomous model if delta is negligible. |
 
 ---
 
@@ -919,7 +1099,16 @@ The philosophy: graceful degradation first, halt only as last resort. The system
 
 This prevents the "telephone game" failure where summaries-of-summaries drift from reality over many checkpoints. Most sessions' raw history fits within the upper model's 200K context window. For sessions exceeding 200K raw tokens: progressive summarization (chunk → summarize → combine).
 
-### RD-11: Auto-configuration via `/routing setup`
+### RD-11: Interaction mode as routing signal
+**Resolved 2026-06-06:** The routing system has a second classification axis: interaction mode (interactive vs. autonomous). This determines which lower model handles routine work:
+- **Interactive mode** (user present, conversational): prioritize latency → fast MoE model (little-qwen, 139 tok/s)
+- **Autonomous mode** (overnight, cron, subagent, user idle): prioritize reasoning quality → denser model (Qwen3.6-27B, 6 tok/s)
+
+Detection is automatic (platform signals, idle time, turn patterns) with explicit override via `/mode` command. The transition from interactive → autonomous is cautious (threshold-based), while autonomous → interactive is instant (any user message).
+
+This means Qwen3.6-27B has a clear role in the system despite being too slow for interactive use — it's the overnight workhorse. The capability graph gains a "mode" dimension: the same tier can have different model selections depending on whether anyone is waiting.
+
+### RD-12: Auto-configuration via `/routing setup`
 **Resolved 2026-06-06:** The routing system must be configurable without writing YAML. A `/routing setup` slash command:
 
 1. Discovers all configured models (scan config.yaml, ping local endpoints)
