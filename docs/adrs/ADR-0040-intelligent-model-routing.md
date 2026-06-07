@@ -1049,8 +1049,43 @@ Only one local model runs at a time on `:58080`. Mode/model transitions require 
 
 The swap latency (8-17s) is acceptable for mode transitions because:
 - **interactive → autonomous:** user is already gone, no one is waiting
-- **autonomous → interactive:** the *first* response back can go to Opus (cloud, instant) while the local model loads in the background
+- **autonomous → interactive:** symmetric delay applies (see RD-16) — don't swap eagerly on a single message
 - **primary ↔ fast fallback:** these are rare edge cases; the 8s swap for little-qwen is fast enough
+
+### RD-16: Symmetric lazy swap-back + cloud-orchestrated transitions
+**Resolved 2026-06-06:** Model swap timing is symmetric in both directions. Just as we don't eagerly switch to the autonomous model when the user goes idle (10-min threshold), we don't eagerly switch back to the interactive model when the user returns. The slower model handles the first message(s) — a little slower, but no wasted swap.
+
+**Lazy swap-back triggers:**
+- User sends 2-3 messages within a short window (sustained engagement detected)
+- User explicitly requests faster responses
+- Turn router scores a turn as complex enough to warrant the interactive model's speed
+
+If the user types one message and leaves again, no swap occurs — the autonomous model handles it at 6.5 tok/s. Slower, but avoids a 17s swap that would have been immediately reversed.
+
+**Cloud-orchestrated swap:** When the swap *does* trigger, the cloud model (upper) serves a dual role:
+
+1. **Operational:** It orchestrates the mechanical transition — unloads model A, loads model B, verifies readiness, confirms handoff. This is *useful work*, not wasted tokens.
+2. **Conversational:** It may respond to the user's current turn as a side effect, but the primary purpose is supervision of the swap.
+
+This means the cloud turn during a transition is a **micro-oversight action**, not gap-filling. The cloud model earns its tokens by:
+- Deciding whether the swap is warranted (confirms the router's signal)
+- Managing the swap mechanics (issues `llm start <model>`, waits for health check)
+- Verifying the new model is ready before handing off
+- Optionally continuing the conversation during the swap window
+
+**State machine:**
+```
+USER_RETURNS → [slow model handles turn 1]
+              → [user sends turn 2 within threshold]
+              → SWAP_TRIGGERED
+              → cloud model takes turn 2, begins swap in background
+              → [swap completes, health check passes]
+              → SWAP_COMPLETE → local interactive model handles turn 3+
+```
+
+**Failure handling:**
+- If local model fails to load within 30s: cloud model stays active, warns user, logs diagnostic
+- If user stops interacting during swap: abort swap, stay on current model (the trigger was wrong)
 
 For v2, preloading two models simultaneously (if RAM permits) eliminates swap latency entirely. With 128 GB: Coder-Next (61 GB) + little-qwen (22 GB) = 83 GB leaves 45 GB for system — tight but feasible on separate ports.
 
@@ -1242,14 +1277,15 @@ The capability database is shipped with Hermes and updated with new model releas
    - Autonomous lower: must exceed a quality floor (reasoning benchmark threshold)
    - Fast fallback: must exceed a speed floor (e.g., >100 tok/s)
    - Upper: must exceed a capability ceiling (hardest tasks, compression quality)
-5. **Re-evaluates on model additions** — when a new model is downloaded or a new provider configured, re-runs placement to see if the graph should change
+5. **Re-evaluates on model additions** — when a new model is downloaded, a new provider configured, or a model is enabled/disabled in config, re-runs placement to see if the graph should change
 
 This is a **Phase 5+** system, built after the routing architecture is validated. For v1, graph positions are manually configured (the current Target Model Lineup). RD-13's `/routing setup` is the user-facing wrapper for this system.
 
-The key principle: **the routing system never hardcodes model names.** It references graph positions. The placement system maps models → positions. This means:
-- A new Qwen release drops tomorrow → placement system benchmarks it → it may replace Coder-Next as interactive lower
-- User adds a Sonnet API key → placement system evaluates cost/quality → it may slot in as a mid-tier between lower and upper
-- User downgrades hardware → placement system detects RAM constraint → falls back to smaller models automatically
+The key principle: **the routing system never hardcodes model names.** It references graph positions. The placement system maps models → positions. The input is **all models the user has actually enabled** — any mix of local (llama.cpp), Anthropic, OpenAI, Google, Bedrock, custom providers. The system evaluates whatever is configured in `config.yaml` and available via configured providers. This means:
+- User has Opus + Sonnet (Bedrock) + local Coder-Next → placement assigns all three to optimal positions
+- User adds an OpenAI o3 key → placement benchmarks it → it may slot as a new mid-tier or displace Opus for certain roles
+- User only has local models → placement builds a graph entirely from local, using the best available for upper/oversight
+- User downgrades hardware → placement detects RAM constraint → falls back to smaller models automatically
 
 ### RD-15: Routing is brain-swap, not subagent dispatch
 **Resolved 2026-06-06:** The routing system performs a **true model swap** — it changes which model powers Hermes's primary inference loop. This is NOT a subagent/delegation pattern. The distinction:
