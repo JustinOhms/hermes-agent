@@ -502,16 +502,28 @@ When it returns `"escalate"`:
 4. Add escalation logging (for threshold tuning)
 5. Tests: mock responses with various failure patterns
 
+### Phase 2.5: `ask_upper` Tool
+
+1. Create `agent/routing/ask_upper.py` — tool implementation following `auxiliary_client` pattern
+2. Synchronous call to upper model with structured request types (guidance, review, distill)
+3. Soft budget with warning after N calls per session (default 5)
+4. Token cap on context parameter (~4K tokens max)
+5. Graceful degradation when upper model unreachable ("proceed with best judgment")
+6. Register tool dynamically only when routing is enabled and model is in lower position
+7. Tests: mock upper model responses, budget enforcement, unreachable fallback
+
 ### Phase 3: Periodic Oversight
 
-1. Create `agent/oversight.py` — follows `background_review.py` pattern
+1. Create `agent/oversight.py` — synchronous reviewer (NOT the async `background_review.py` pattern; runs between turns, blocks until complete per RD-5)
 2. Oversight prompt + action parsing
-3. Hook into turn counter in conversation loop
-4. Injection mechanism for corrections
-5. Escalation handoff (oversight model takes one turn)
-6. User notification for flags
-7. TUI indicator when oversight is active
-8. Tests: mock oversight responses, verify injection behavior
+3. Hook into turn counter in conversation loop (synchronous pause every N turns)
+4. Injection mechanism for corrections (insert before next lower-model turn)
+5. Dynamic review window cap: `min(config.review_window, upper_ctx * 0.6 / avg_tokens_per_turn)` to prevent upper model context overflow (see RD-18)
+6. Escalation handoff (oversight model takes over for one turn)
+7. User notification for flags
+8. TUI indicator when oversight is active
+9. Full calibration pass every M checkpoints (re-read raw session from SQLite, fresh summary from ground truth per RD-10)
+10. Tests: mock oversight responses, verify injection behavior, window cap math
 
 ### Phase 4: Observability & Tuning
 
@@ -1416,3 +1428,47 @@ This means:
 - Routing is invisible except for speed/quality differences in responses
 
 `delegate_task` remains a separate mechanism for spawning isolated subagents. A subagent *might* internally use a routed model (if routing is enabled for subagents), but that's composition — not routing being implemented *as* delegation.
+
+### RD-18: Dynamic review window cap
+
+**Resolved 2026-06-07:** The oversight reviewer's review window (how many turns it includes when reviewing lower-model output) must be dynamically capped to prevent upper model context overflow.
+
+**Problem:** If per-turn average token usage is high (e.g., 15K tokens/turn × 10-turn review window = 150K tokens + 30K previous summary = 180K), we approach the upper model's context limit (200K for Opus). This leaves no room for the oversight prompt, correction generation, or safety margin.
+
+**Formula:**
+```
+effective_window = min(
+    config.oversight.review_window,           # user-configured max (default 10)
+    floor(upper_ctx_limit * 0.6 / avg_tokens_per_turn)  # dynamic cap
+)
+```
+
+The 0.6 factor reserves 40% of the upper model's context for: the oversight system prompt (~2K), previous compressed summary (~30K worst case), correction output, and safety margin.
+
+`avg_tokens_per_turn` is computed as a rolling average over the last 20 turns (both user + assistant messages). This adapts automatically — code-heavy sessions with large tool outputs get smaller review windows; conversational sessions get larger ones.
+
+**Edge cases:**
+- If `effective_window < 2`: force minimum of 2 turns (reviewing a single turn isn't meaningful oversight)
+- If `effective_window < config.review_window`: log a warning ("oversight window reduced from N to M due to large turn sizes")
+- If turns are wildly uneven (one 50K turn among 2K turns): use p75 instead of mean to avoid one outlier shrinking the window permanently
+
+**Config:**
+```yaml
+model:
+  routing:
+    oversight:
+      review_window: 10              # max turns to review (hard cap)
+      review_window_ctx_fraction: 0.6  # fraction of upper ctx reserved for review content
+      review_window_min: 2           # never review fewer than this many turns
+```
+
+### RD-19: `ask_upper` tool placement in phased plan
+
+**Resolved 2026-06-07:** `ask_upper` is Phase 2.5 — implemented after the swap execution machinery (Phase 2) is working but before periodic oversight (Phase 3). Rationale:
+
+1. `ask_upper` is simpler than full oversight (single synchronous call vs. periodic reviewer with compression)
+2. It validates the upper-model calling pattern that oversight will reuse
+3. It provides immediate value — the lower model can self-rescue before oversight is built
+4. It's independently useful even if oversight is never enabled (some users may want routing + ask_upper without periodic review)
+
+The tool is registered dynamically: only appears in the tool schema when `model.routing.enabled = true` AND the current model is in a lower-tier graph position. Upper models don't see `ask_upper` (they'd be asking themselves).
