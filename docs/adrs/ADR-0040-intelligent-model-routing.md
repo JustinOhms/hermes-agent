@@ -187,7 +187,7 @@ This resolves the "Qwen3.6-27B is too slow" problem: it's too slow *interactivel
 
 | Interaction Mode | Complexity Tier | Selected Model | Rationale |
 |------------------|-----------------|----------------|-----------|
-| `interactive` | `routine` | little-qwen (MoE, 139 tok/s) | Fast + free, user waiting |
+| `interactive` | `routine` | Coder-Next (MoE, 33 tok/s) | Smart + fast + free, user waiting |
 | `interactive` | `complex` | Opus (cloud) | User waiting, quality needed |
 | `autonomous` | `routine` | Qwen3.6-27B (dense, 6 tok/s) | Quality > speed, nobody watching |
 | `autonomous` | `complex` | Opus (cloud) | Hardest problems still escalate |
@@ -910,7 +910,7 @@ Combined with the oversight review (which reads the same context), total per-che
 
 ## Target Model Lineup (v1 Validation)
 
-The initial implementation targets a four-node capability graph with measured benchmarks from M5 Max 128 GB hardware.
+The initial implementation targets a four-node capability graph with measured benchmarks from M5 Max 128 GB hardware. **All model assignments are placeholders.** The routing architecture is model-agnostic — any model can occupy any position in the graph. A separate **model evaluation and placement system** (see RD-14) determines which models fill which roles based on measured performance, quality, cost, and hardware constraints. The lineup below is the v1 validation target, not a permanent assignment.
 
 ### Interactive Lower Model: Qwen3-Coder-Next (Q4_K_M)
 
@@ -1095,7 +1095,7 @@ In the expanded graph:
 2. **Quality maintained:** Oversight catches errors before they compound (< 3 turns of drift)
 3. **Transparent:** User always knows which model is active (TUI indicator)
 4. **Zero-config viable:** Works with just `routing.enabled: true` + primary/escalation models defined
-5. **No latency penalty:** Router adds < 5ms per turn; oversight is async
+5. **No routing latency penalty:** Router adds < 5ms per turn; oversight runs synchronously every N turns (~3-5s pause, amortized over the interval)
 
 ---
 
@@ -1166,8 +1166,7 @@ For v1, we implement the two-node case. The data structures support N nodes from
 4. **Compression fidelity:** How do we verify the compression didn't lose critical context?
    - Leaning: Full calibration pass every 5th checkpoint re-reads raw history from disk. Plus: append-only "key decisions" section never trimmed.
 
-5. **How does this interact with `delegate_task`?** Subagents have their own model config — should they inherit routing?
-   - Leaning: subagents use `delegation.model` as today; routing is session-level only
+5. **How does this interact with `delegate_task`?** Routing is brain-swap (same agent, different model); delegation is subagent dispatch (different agent, isolated context). These are orthogonal. Subagents use `delegation.model` as today. Routing may apply *within* a subagent if routing is enabled for subagent sessions — but routing is never *implemented as* delegation. See RD-15.
 
 6. **Should the routing config be part of a profile?** So you can have `hermes -p local` (routing on) and `hermes -p opus` (always Opus)?
    - Leaning: yes, naturally — each profile has its own config.yaml
@@ -1231,3 +1230,45 @@ De-escalation is conservative (most routine work stays on the primary lower) and
 This means the entire routing feature can be enabled by typing `/routing setup` and pressing Accept. The system does the work of figuring out which models should be upper/lower, where oversight belongs, and what thresholds make sense.
 
 The capability database is shipped with Hermes and updated with new model releases. For unknown models (user's custom fine-tunes, new releases), the system can either ask the user or run a brief capability probe (a few test prompts to gauge reasoning depth and tool-calling reliability).
+
+### RD-14: Model-agnostic graph — separate evaluation and placement system
+**Resolved 2026-06-06:** The routing architecture is completely model-agnostic. The capability graph defines **roles** (interactive lower, autonomous lower, fast fallback, upper/oversight) — not specific models. Which models fill which roles is determined by a separate **model evaluation and placement system** that:
+
+1. **Benchmarks available models** — measures tok/s (prompt + generation), tool-calling reliability, reasoning quality on standard tasks, context window handling
+2. **Profiles hardware constraints** — available RAM, bandwidth ceiling, max concurrent models
+3. **Calculates cost curves** — per-token API costs, amortized local compute, energy
+4. **Places models into graph positions** — optimizes for the routing system's requirements:
+   - Interactive lower: must exceed a latency floor (e.g., >20 tok/s)
+   - Autonomous lower: must exceed a quality floor (reasoning benchmark threshold)
+   - Fast fallback: must exceed a speed floor (e.g., >100 tok/s)
+   - Upper: must exceed a capability ceiling (hardest tasks, compression quality)
+5. **Re-evaluates on model additions** — when a new model is downloaded or a new provider configured, re-runs placement to see if the graph should change
+
+This is a **Phase 5+** system, built after the routing architecture is validated. For v1, graph positions are manually configured (the current Target Model Lineup). RD-13's `/routing setup` is the user-facing wrapper for this system.
+
+The key principle: **the routing system never hardcodes model names.** It references graph positions. The placement system maps models → positions. This means:
+- A new Qwen release drops tomorrow → placement system benchmarks it → it may replace Coder-Next as interactive lower
+- User adds a Sonnet API key → placement system evaluates cost/quality → it may slot in as a mid-tier between lower and upper
+- User downgrades hardware → placement system detects RAM constraint → falls back to smaller models automatically
+
+### RD-15: Routing is brain-swap, not subagent dispatch
+**Resolved 2026-06-06:** The routing system performs a **true model swap** — it changes which model powers Hermes's primary inference loop. This is NOT a subagent/delegation pattern. The distinction:
+
+| Aspect | Routing (brain-swap) | Delegation (subagent) |
+|--------|---------------------|----------------------|
+| Identity | Same agent, different brain | Different agent, spawned child |
+| Context | Shared conversation history | Isolated context (summary only) |
+| Tools | Full tool access, same session | Restricted toolset, own session |
+| Memory | Same memory.md, same user profile | No memory access |
+| Continuity | Seamless — user doesn't notice | Explicit handoff and report-back |
+| State | Same working directory, same git branch | Own working directory |
+
+When the router swaps from Coder-Next to Opus, the user is still talking to **the same Hermes**. The conversation continues in the same session, with the same context, the same tools, the same personality. Only the underlying model changes — like swapping the engine in a car while it's driving.
+
+This means:
+- No `delegate_task` calls in the routing path (delegation is orthogonal)
+- The swapped-in model inherits the full message history (or compressed equivalent)
+- The user sees a TUI indicator change, not a new conversation
+- Routing is invisible except for speed/quality differences in responses
+
+`delegate_task` remains a separate mechanism for spawning isolated subagents. A subagent *might* internally use a routed model (if routing is enabled for subagents), but that's composition — not routing being implemented *as* delegation.
