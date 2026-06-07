@@ -651,6 +651,37 @@ def should_emergency_compress(self) -> bool:
     return False
 ```
 
+#### The Closed Loop: Self-Tuning Compression
+
+The compression system forms a closed feedback loop that self-tunes over the session:
+
+```
+Upper model observes session dynamics
+         │
+         ▼
+Calculates: "this session uses ~8K/turn on average"
+         │
+         ▼
+At checkpoint: compresses to leave exactly enough headroom
+         │
+         ▼
+Lower model works for N turns (uses the headroom)
+         │
+         ▼
+Upper model observes how much was actually used
+         │
+         ▼
+Next checkpoint: adjusts compression target accordingly
+         │
+         └──── (repeat — the system self-tunes)
+```
+
+The upper model isn't just compressing — it's **managing a resource budget for a subordinate agent**, adapting in real-time to how that agent actually works. If the lower model starts doing more code-heavy work (reading large files, reviewing diffs), the upper model automatically tightens the summary at the next checkpoint. If the session shifts to lightweight Q&A, it relaxes and preserves more detail.
+
+**Critical escalation signal:** If the adaptive budget calculation yields `max_summary_tokens < 2000` (can't compress enough to leave room), the lower model's context window is fundamentally too small for what's happening. This triggers automatic escalation — the upper model stays active for the remainder of the session, or until the workload lightens enough that handback becomes viable again.
+
+This creates a natural "complexity ceiling" detection: the system doesn't just route based on message content, it routes based on **observed resource consumption patterns**. A session that starts simple but gradually becomes resource-intensive will organically transition to the upper model without any explicit trigger.
+
 #### Compression Budget
 
 Each compression costs:
@@ -688,9 +719,92 @@ Combined with the oversight review (which reads the same context), total per-che
 | Router misclassifies complex turns as routine | Local model struggles, wastes turns | Failure escalation catches it post-hoc; oversight catches it periodically |
 | Router over-escalates (everything goes to cloud) | Cost savings disappear | Hysteresis + tunable thresholds + explicit `strategy: always-primary` override |
 | Oversight corrections confuse the primary model | Degraded responses after correction injection | Correction framing tested empirically; fallback: flag user instead of injecting |
-| Oversight adds latency | User waits for oversight before next turn | Oversight runs async (background thread, like background_review.py) — user never waits |
+| Oversight adds latency | User waits for oversight before next turn | Oversight runs synchronously but is fast (~3-5s for 10 turns review on Opus) |
 | Local model goes down mid-session | Session breaks | Existing fallback mechanism handles this — escalation model becomes sole provider |
 | Config complexity | Users confused by routing config | Sensible defaults + `hermes setup` wizard step + `hermes doctor` validates routing config |
+| Compression loses critical context | Lower model confused after handback | Differential compression preserves key decisions; lower model has `ask_upper(type=distill)` as escape hatch; oversight catches confusion at next checkpoint |
+| `ask_upper` cost explosion | Lower model over-relies on upper | Soft budget with warning after N calls; upper model's mentor prompt encourages independence |
+| Adaptive budget miscalculates | Summary too large (no headroom) or too small (lost context) | p90 with 1.3× safety margin is conservative; emergency compression at 70% as backstop |
+
+---
+
+## Target Model Lineup (v1 Validation)
+
+The initial implementation targets this specific two-node graph for validation:
+
+### Lower Model: Qwen3-Coder-Next (Q4_K_M)
+
+| Property | Value |
+|----------|-------|
+| Architecture | 80B MoE, 3B active parameters per token |
+| Quantization | Q4_K_M (45 GB on disk) |
+| Context window | 262,144 tokens (native, no RoPE hacks) |
+| KV cache | 2 heads × 128 dim × 80 layers = tiny; Q8_0 at 262K ≈ 6 GB |
+| Total RAM | ~61 GB (weights + KV + overhead) |
+| Inference speed | ~15-25 tok/s on M5 Max (3B active params, memory-bandwidth bound) |
+| Strengths | Code generation, tool calling, instruction following |
+| Weaknesses | Complex multi-step reasoning, architecture decisions, long-horizon planning |
+| llama-server flags | `--flash-attn --cache-type-k q8_0 --cache-type-v q8_0 -c 262144 -ngl 99` |
+| Provider config | `custom` provider, `http://127.0.0.1:58080/v1`, `sk-local` |
+
+### Upper Model: Claude Opus 4.6
+
+| Property | Value |
+|----------|-------|
+| Architecture | Frontier cloud model |
+| Context window | 200,000 tokens (native) |
+| Cost | ~$15/M input, ~$75/M output (Bedrock) |
+| Strengths | Complex reasoning, architecture, planning, summarization, oversight |
+| Weaknesses | Cost, latency (~5-15s for complex turns) |
+| Provider config | `bedrock`, `us.anthropic.claude-opus-4-6-v1` |
+
+### Capability Graph (v1)
+
+```
+┌──────────────────────────────────────┐
+│  Claude Opus 4.6 (upper)             │
+│  200K ctx │ $15/$75 per M │ 5-15s    │
+│  Roles: oversight, mentor, escalation│
+│          compression, handback       │
+└──────────────────┬───────────────────┘
+                   │ upper_of
+                   │ (escalation triggers, handback protocol,
+                   │  compression targeting, mentor tool)
+                   │
+┌──────────────────┴───────────────────┐
+│  Qwen3-Coder-Next Q4_K_M (lower)    │
+│  262K ctx │ $0 │ 15-25 tok/s         │
+│  Roles: primary workhorse, routine   │
+│          tool: ask_upper             │
+└──────────────────────────────────────┘
+```
+
+### Future Graph Expansion (v2+)
+
+```
+         ┌─────────────┐
+         │   Opus 4.6  │  (reasoning, architecture, oversight)
+         └──────┬──────┘
+                │ upper_of
+         ┌──────┴──────┐
+         │  Sonnet 4   │  (general purpose, fast cloud, mid-tier oversight)
+         └──────┬──────┘
+                │ upper_of
+     ┌──────────┼──────────┐
+     │                     │
+┌────┴─────┐         ┌────┴─────┐
+│  Coder   │         │ Qwen3.6  │  (local specialists)
+│  Next    │         │   27B    │
+│  (code)  │         │  (prose) │
+└──────────┘         └──────────┘
+```
+
+In the expanded graph:
+- Coder-Next handles code tasks, Qwen3.6-27B handles prose/research
+- Either can escalate to Sonnet (fast cloud, cheaper than Opus)
+- Sonnet escalates to Opus only for the hardest problems
+- Each edge has its own handoff protocol and compression parameters
+- The router selects both the tier AND the specialist within a tier
 
 ---
 
