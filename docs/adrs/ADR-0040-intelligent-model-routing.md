@@ -1472,3 +1472,74 @@ model:
 4. It's independently useful even if oversight is never enabled (some users may want routing + ask_upper without periodic review)
 
 The tool is registered dynamically: only appears in the tool schema when `model.routing.enabled = true` AND the current model is in a lower-tier graph position. Upper models don't see `ask_upper` (they'd be asking themselves).
+
+### RD-20: Phase 3 Implementation Architecture
+
+**Resolved 2026-06-08:** Phase 3 (Periodic Oversight) implementation follows a synchronous, between-turn pattern with four possible actions.
+
+#### Integration Points
+
+1. **`agent/routing/oversight.py`** — Core reviewer:
+   - `OversightReviewer` class: cached on agent, tracks review count/budget/history
+   - `should_review()`: guards on enabled, budget, cadence, min turns, escalation skip
+   - `compute_effective_window()`: RD-18 dynamic cap using p75 token counts
+   - `review()`: synchronous LLM call to upper model with formatted conversation window
+   - Response parsing: handles clean JSON, markdown-fenced JSON, malformed → approve
+
+2. **`agent/routing/ask_upper.py`** — RD-19 tool:
+   - `AskUpperTool` class: budget-controlled (soft=3, hard=5 by default)
+   - Five request types: simplify, plan, verify, distill, explain
+   - Context truncation at 15k chars with indicator
+   - Graceful degradation: UNAVAILABLE message when upper unreachable
+
+3. **`conversation_loop.py`** post-turn hook:
+   - Fires after `final_response` determined, before result assembly
+   - `run_oversight_if_due()` → `OversightResult`
+   - CORRECT: appends system injection message to `messages` list
+   - ESCALATE: sets `agent._oversight_escalation_pending = True`
+   - FLAG: `send_notification()` to user's async channel (best effort)
+   - APPROVE: silent (only logs)
+
+4. **`agent_init.py`** tool registration:
+   - `should_register_ask_upper(agent)` checks routing enabled + lower position
+   - Appends to `agent.tools` + `agent.valid_tool_names`
+
+5. **`tool_executor.py`** dispatch:
+   - `elif function_name == "ask_upper"` branch with spinner
+
+6. **`tui_gateway/server.py`** observability:
+   - `/routing oversight` subcommand shows review history
+   - `_session_info()` includes oversight review count + last action
+
+#### Failure Mode
+
+Oversight review failure (timeout, 5xx, parse error) **always defaults to APPROVE**. The lower model must not be blocked by an unavailable oversight model. The failure is logged and counted against the review budget.
+
+#### Config (to be added to config.yaml)
+
+```yaml
+model:
+  routing:
+    oversight:
+      enabled: true
+      model: us.anthropic.claude-opus-4-6-v1
+      provider: bedrock
+      every_n_turns: 10
+      review_window: 10
+      review_window_ctx_fraction: 0.6
+      review_window_min: 2
+      max_reviews_per_session: 5
+      min_turns_before_first: 5
+      skip_if_escalated: true
+      upper_context_limit: 200000
+```
+
+### RD-21: ESCALATE action handling (pending)
+
+**Deferred:** When the oversight model returns `ESCALATE`, the flag `_oversight_escalation_pending` is set on the agent. The next `run_conversation()` call should:
+1. Check this flag before routing decisions
+2. Force the upper model for the next turn (bypass turn_router)
+3. Clear the flag after the upper model responds
+4. If the upper model resolves the issue, allow normal routing to resume
+
+This is intentionally not wired yet — it requires the swap machinery (Phase 2) to be tested end-to-end first. The flag is set and logged but not consumed by any turn-start logic yet.
