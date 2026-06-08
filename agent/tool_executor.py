@@ -1135,6 +1135,33 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     spinner.stop(cute_msg)
                 elif agent._should_emit_quiet_tool_messages():
                     agent._vprint(f"  {cute_msg}")
+        elif function_name == "ask_upper":
+            # ask_upper tool (Phase 2.5) — lower model querying upper for guidance
+            spinner = None
+            if agent._should_emit_quiet_tool_messages():
+                face = random.choice(KawaiiSpinner.get_waiting_faces())
+                spinner = KawaiiSpinner(f"{face} 🧠 Consulting upper model...", spinner_type='dots', print_fn=agent._print_fn)
+                spinner.start()
+            try:
+                from agent.routing.ask_upper import get_or_create_ask_upper_tool
+                _ask_tool = get_or_create_ask_upper_tool(agent)
+                if _ask_tool is None:
+                    function_result = json.dumps({"error": "ask_upper not available — routing disabled or upper model not configured"})
+                else:
+                    request_type = function_args.get("request_type", "verify")
+                    question = function_args.get("question", "")
+                    context = function_args.get("context", "")
+                    function_result = _ask_tool.execute(request_type, question, context)
+            except Exception as tool_error:
+                function_result = json.dumps({"error": f"ask_upper failed: {tool_error}"})
+                logger.error("ask_upper tool failed: %s", tool_error, exc_info=True)
+            finally:
+                tool_duration = time.time() - tool_start_time
+                cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration)
+                if spinner:
+                    spinner.stop(cute_msg)
+                elif agent._should_emit_quiet_tool_messages():
+                    agent._vprint(f"  {cute_msg}")
         elif agent._memory_manager and agent._memory_manager.has_tool(function_name):
             # Memory provider tools (hindsight_retain, honcho_search, etc.)
             # These are not in the tool registry — route through MemoryManager.

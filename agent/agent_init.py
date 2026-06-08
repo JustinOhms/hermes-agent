@@ -1608,6 +1608,31 @@ def init_agent(
         working_dir=os.getenv("TERMINAL_CWD") or None,
     )
     agent._user_turn_count = 0
+    agent._oversight_escalation_pending = False
+
+    # ── ask_upper tool (Phase 2.5) ───────────────────────────────────
+    # Register ask_upper if routing is enabled and we're running a lower
+    # model.  This gives the lower model a lifeline to query the upper
+    # model for guidance without full escalation.
+    try:
+        from agent.routing.ask_upper import (
+            should_register_ask_upper,
+            ASK_UPPER_TOOL_SCHEMA,
+        )
+        if agent.tools is not None and should_register_ask_upper(agent):
+            _existing_tool_names = {
+                t.get("function", {}).get("name")
+                for t in agent.tools
+                if isinstance(t, dict)
+            }
+            if "ask_upper" not in _existing_tool_names:
+                agent.tools.append({"type": "function", "function": ASK_UPPER_TOOL_SCHEMA})
+                agent.valid_tool_names.add("ask_upper")
+                _ra().logger.info("ask_upper tool registered (lower model detected)")
+    except ImportError:
+        pass
+    except Exception as _au_err:
+        _ra().logger.debug("ask_upper registration skipped: %s", _au_err)
 
     # Cumulative token usage for the session
     agent.session_prompt_tokens = 0

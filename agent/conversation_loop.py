@@ -4885,6 +4885,57 @@ def run_conversation(
         except Exception as exc:
             logger.warning("post_llm_call hook failed: %s", exc)
 
+    # ── Periodic Oversight (Phase 3) ─────────────────────────────────
+    # After the turn completes, check if the upper model should review
+    # the lower model's recent work.  Runs synchronously — blocks until
+    # the oversight model responds.  On CORRECT, injects guidance into
+    # messages for next turn.  On ESCALATE, sets a flag for next turn.
+    # On FLAG, notifies the user via async channel.
+    if final_response and not interrupted:
+        try:
+            from agent.routing.oversight import (
+                run_oversight_if_due,
+                build_oversight_injection,
+                OversightAction,
+            )
+            _oversight_result = run_oversight_if_due(
+                agent, messages, getattr(agent, "_user_turn_count", 0)
+            )
+            if _oversight_result is not None:
+                if _oversight_result.action == OversightAction.CORRECT:
+                    # Inject guidance for next turn
+                    _injection = build_oversight_injection(
+                        _oversight_result,
+                        getattr(agent, "_oversight_reviewer", None)
+                        and agent._oversight_reviewer.config.model or "oversight",
+                    )
+                    messages.append(_injection)
+                    logger.info("oversight: injected correction for next turn")
+                elif _oversight_result.action == OversightAction.ESCALATE:
+                    # Signal next turn to use upper model
+                    agent._oversight_escalation_pending = True
+                    logger.warning(
+                        "oversight: ESCALATION requested — reason: %s",
+                        _oversight_result.reason,
+                    )
+                elif _oversight_result.action == OversightAction.FLAG:
+                    # Notify user asynchronously
+                    logger.warning(
+                        "oversight: FLAG — %s", _oversight_result.warning
+                    )
+                    try:
+                        from hermes_cli.notifications import send_notification
+                        send_notification(
+                            f"🔍 Oversight Warning: {_oversight_result.warning}",
+                            title="Routing Oversight",
+                        )
+                    except Exception:
+                        pass  # Best effort
+        except ImportError:
+            pass  # Routing module not available
+        except Exception as exc:
+            logger.warning("oversight hook failed: %s", exc)
+
     # Extract reasoning from the CURRENT turn only.  Walk backwards
     # but stop at the user message that started this turn — anything
     # earlier is from a prior turn and must not leak into the reasoning

@@ -2008,6 +2008,14 @@ def _session_info(agent, session: dict | None = None) -> dict:
                 "mode": rstate.interaction_mode,
                 "swap_state": rstate.swap_state,
             }
+            # Overlay oversight status if reviewer exists
+            reviewer = getattr(agent, "_oversight_reviewer", None)
+            if reviewer is not None:
+                info["routing"]["oversight"] = {
+                    "reviews": reviewer.review_count,
+                    "max": reviewer.config.max_reviews_per_session,
+                    "last_action": reviewer.reviews[-1].action.value if reviewer.reviews else None,
+                }
     except Exception:
         pass
     return info
@@ -7872,8 +7880,34 @@ def _handle_routing_command(sid: str, session: dict, agent, arg: str) -> str:
             lines.append(f"  [{ts_str}] target={target} complexity={complexity} mode={mode}{swap_str}")
         return "\n".join(lines)
 
+    elif subcommand == "oversight":
+        try:
+            from agent.routing.oversight import get_or_create_oversight_reviewer
+            reviewer = get_or_create_oversight_reviewer(agent)
+        except Exception:
+            reviewer = None
+
+        if reviewer is None:
+            return "Oversight: disabled (not configured or model.routing.oversight.enabled=false)"
+
+        status = reviewer.get_status()
+        lines = ["🔍 Oversight Status:"]
+        lines.append(f"  Reviews: {status['reviews_completed']}/{status['max_reviews']}")
+        lines.append(f"  Every: {status['every_n_turns']} turns")
+        if status['budget_exhausted']:
+            lines.append("  Budget: EXHAUSTED")
+        if status['last_action']:
+            lines.append(f"  Last action: {status['last_action']}")
+        if status['history']:
+            lines.append("  History:")
+            for h in status['history']:
+                ts_str = _time.strftime("%H:%M:%S", _time.localtime(h['timestamp']))
+                note_preview = f" — {h['note']}" if h['note'] else ""
+                lines.append(f"    [{ts_str}] {h['action']}{note_preview}")
+        return "\n".join(lines)
+
     else:
-        return "Usage: /routing [status|graph|swap|mode|history]"
+        return "Usage: /routing [status|graph|swap|mode|history|oversight]"
 
 
 def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
