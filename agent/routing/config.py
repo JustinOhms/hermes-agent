@@ -26,6 +26,7 @@ class GraphPosition:
     api_mode: str = ""
     api_key: str = ""
     llm_config_name: str = ""  # name for `llm start <name>`; set for local models
+    display_name: str = ""     # human-friendly name (e.g. "Claude Opus 4"); used by fingerprint
 
 
 @dataclass
@@ -78,6 +79,7 @@ def _parse_graph(raw: Dict[str, Any]) -> Dict[str, GraphPosition]:
             api_mode=str(pos_raw.get("api_mode", "")),
             api_key=str(pos_raw.get("api_key", "")),
             llm_config_name=str(pos_raw.get("llm_config_name", "")),
+            display_name=str(pos_raw.get("display_name", "")),
         )
     return positions
 

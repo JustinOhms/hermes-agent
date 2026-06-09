@@ -2019,6 +2019,17 @@ def _session_info(agent, session: dict | None = None) -> dict:
                 }
     except Exception:
         pass
+    # ── Model fingerprint ────────────────────────────────────────────────
+    # Resolved per-turn in the conversation loop and stashed on the agent.
+    # Provides the TUI with authoritative model identity (display_name,
+    # position, family) independent of the cached system prompt.
+    _fp = getattr(agent, "_current_fingerprint", None)
+    if _fp is not None:
+        try:
+            info["fingerprint"] = _fp.to_dict()
+        except Exception:
+            pass
+    # ─────────────────────────────────────────────────────────────────────
     return info
 
 
@@ -4861,6 +4872,19 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     run_kwargs["task_id"] = session["session_key"]
             except (TypeError, ValueError):
                 pass
+
+            # ── Register model-change callback for pre-streaming TUI update ──
+            # When the routing system swaps the model before the first API call,
+            # this callback fires to emit an updated session.info so the TUI
+            # status bar reflects the new model before streaming starts.
+            def _on_model_change(_agent, _sid=sid, _session=session):
+                try:
+                    _emit("session.info", _sid, _session_info(_agent, _session))
+                    _session["_last_info_model"] = getattr(_agent, "model", "")
+                except Exception:
+                    pass
+            agent._on_model_change_callback = _on_model_change
+            # ─────────────────────────────────────────────────────────────────
 
             try:
                 result = agent.run_conversation(run_message, **run_kwargs)
@@ -7856,7 +7880,7 @@ def _handle_routing_command(sid: str, session: dict, agent, arg: str) -> str:
             # Update swap manager position tracking
             swap_mgr = getattr(agent, "_routing_swap_manager", None)
             if swap_mgr is not None:
-                swap_mgr.current_position = target_position
+                swap_mgr.set_current_position(target_position)
             # Set explicit override so auto-routing doesn't fight it
             setattr(agent, "_routing_explicit_override", target_position)
             _emit("session.info", sid, _session_info(agent))
@@ -7928,7 +7952,7 @@ def _handle_routing_command(sid: str, session: dict, agent, arg: str) -> str:
             )
             swap_mgr = getattr(agent, "_routing_swap_manager", None)
             if swap_mgr is not None:
-                swap_mgr.current_position = target_position
+                swap_mgr.set_current_position(target_position)
             setattr(agent, "_routing_explicit_override", target_position)
             _emit("session.info", sid, _session_info(agent))
             direction = "⬆️" if subcommand == "upgrade" else "⬇️"
@@ -7995,8 +8019,35 @@ def _handle_routing_command(sid: str, session: dict, agent, arg: str) -> str:
                 lines.append(f"    [{ts_str}] {h['action']}{note_preview}")
         return "\n".join(lines)
 
+    elif subcommand == "identity":
+        # Display the model fingerprint dictionary — all known models with
+        # their resolved identity (display_name, provider, position, family).
+        try:
+            from agent.routing.fingerprint import get_fingerprint_table
+            table = get_fingerprint_table(agent)
+        except Exception as e:
+            return f"fingerprint unavailable: {e}"
+        if not table:
+            return "no fingerprint data available"
+        lines = ["Model Fingerprint Registry:"]
+        for row in table:
+            active_marker = " ◀ ACTIVE" if row.get("active") else ""
+            source = row.get("source", "")
+            source_tag = f" [{source}]" if source else ""
+            pos = row.get("position") or "-"
+            lines.append(
+                f"  {row.get('display_name', '?')} ({row.get('family', '?')})"
+                f"{active_marker}{source_tag}"
+            )
+            lines.append(f"    model_id:  {row.get('model_id', '?')}")
+            lines.append(f"    provider:  {row.get('provider', '?')}")
+            lines.append(f"    position:  {pos}")
+            lines.append(f"    base_url:  {row.get('base_url', '-')}")
+            lines.append(f"    is_local:  {row.get('is_local', False)}")
+        return "\n".join(lines)
+
     else:
-        return "Usage: /routing [status|graph|swap|upgrade|downgrade|mode|history|oversight]"
+        return "Usage: /routing [status|graph|swap|upgrade|downgrade|mode|history|oversight|identity]"
 
 
 def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
@@ -8123,9 +8174,12 @@ def _(rid, params: dict) -> dict:
     # /routing is gateway-only (needs live agent state, not the CLI subprocess)
     if _cmd_base == "routing":
         agent = session.get("agent")
-        output = _handle_routing_command(
-            params.get("session_id", ""), session, agent, _cmd_arg
-        )
+        try:
+            output = _handle_routing_command(
+                params.get("session_id", ""), session, agent, _cmd_arg
+            )
+        except Exception as e:
+            output = f"routing command error: {e}"
         return _ok(rid, {"output": output or "(no output)"})
 
     worker = session.get("slash_worker")

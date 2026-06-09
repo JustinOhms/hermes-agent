@@ -473,6 +473,17 @@ def run_conversation(
                     _effective.model,
                     _effective.provider,
                 )
+                # Resolve fingerprint immediately after swap so the TUI
+                # callback (if registered) can emit pre-streaming status.
+                try:
+                    from agent.routing.fingerprint import resolve_fingerprint as _rfp
+                    agent._current_fingerprint = _rfp(agent)
+                    # Fire the pre-turn model change callback (set by TUI gateway)
+                    _on_model_change = getattr(agent, "_on_model_change_callback", None)
+                    if _on_model_change:
+                        _on_model_change(agent)
+                except Exception:
+                    pass
         except Exception as _swap_exc:
             logger.warning("routing phase 2 swap failed: %s", _swap_exc, exc_info=True)
 
@@ -1083,9 +1094,26 @@ def run_conversation(
         # every turn.  We send it as a single content string so the
         # bytes are byte-stable across turns and upstream prompt caches
         # stay warm.
+        #
+        # Model identity (fingerprint) is resolved HERE at call time — not
+        # cached — so it always reflects the actual model being called,
+        # even after a routing swap or manual /model switch.
         effective_system = active_system_prompt or ""
+        _ephemeral_parts: list = []
         if agent.ephemeral_system_prompt:
-            effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
+            _ephemeral_parts.append(agent.ephemeral_system_prompt)
+        # ── Model fingerprint injection ──────────────────────────────────
+        try:
+            from agent.routing.fingerprint import resolve_fingerprint
+            _fingerprint = resolve_fingerprint(agent)
+            _ephemeral_parts.append(_fingerprint.to_prompt_line())
+            # Stash on agent for TUI emission (consumed by session.info)
+            agent._current_fingerprint = _fingerprint
+        except Exception as _fp_exc:
+            logger.debug("fingerprint resolution failed: %s", _fp_exc)
+        # ─────────────────────────────────────────────────────────────────
+        if _ephemeral_parts:
+            effective_system = (effective_system + "\n\n" + "\n\n".join(_ephemeral_parts)).strip()
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
@@ -4902,15 +4930,37 @@ def run_conversation(
                 agent, messages, getattr(agent, "_user_turn_count", 0)
             )
             if _oversight_result is not None:
-                if _oversight_result.action == OversightAction.CORRECT:
-                    # Inject guidance for next turn
-                    _injection = build_oversight_injection(
-                        _oversight_result,
-                        getattr(agent, "_oversight_reviewer", None)
-                        and agent._oversight_reviewer.config.model or "oversight",
-                    )
-                    messages.append(_injection)
-                    logger.info("oversight: injected correction for next turn")
+                # Handle tuple return (OversightResult, budget_exhausted)
+                if isinstance(_oversight_result, tuple):
+                    _oversight_result, budget_exhausted = _oversight_result
+                    # If budget exhausted, signal user to reset
+                    if budget_exhausted:
+                        agent._oversight_budget_exhausted = True
+                        logger.info(
+                            "oversight: budget exhausted (%d/%d reviews). "
+                            "Set max_reviews_per_session to increase or continue without oversight. "
+                            "Use /reset-oversight to reset budget.",
+                            getattr(agent, "_oversight_reviewer", None) and 
+                            getattr(agent._oversight_reviewer, "review_count", 0) or 0,
+                            (getattr(agent, "_oversight_reviewer", None) and 
+                            getattr(agent._oversight_reviewer, "config", None) and 
+                            getattr(agent._oversight_reviewer.config, "max_reviews_per_session", 5)) or 5
+                        )
+                if _oversight_result:
+                    # Clear budget exhaustion flag since we ran a review successfully
+                    try:
+                        delattr(agent, '_oversight_budget_exhausted')
+                    except AttributeError:
+                        pass
+                    if _oversight_result.action == OversightAction.CORRECT:
+                        # Inject guidance for next turn
+                        _injection = build_oversight_injection(
+                            _oversight_result,
+                            getattr(agent, "_oversight_reviewer", None)
+                            and agent._oversight_reviewer.config.model or "oversight",
+                        )
+                        messages.append(_injection)
+                        logger.info("oversight: injected correction for next turn")
                 elif _oversight_result.action == OversightAction.ESCALATE:
                     # Signal next turn to use upper model
                     agent._oversight_escalation_pending = True
