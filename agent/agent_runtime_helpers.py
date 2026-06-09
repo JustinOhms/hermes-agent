@@ -1453,7 +1453,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             # Other anthropic_messages providers (MiniMax, Alibaba, etc.) must use their own
             # API key — falling back would send Anthropic credentials to third-party endpoints.
             _is_native_anthropic = new_provider == "anthropic"
-            effective_key = (api_key or agent.api_key or resolve_anthropic_token() or "") if _is_native_anthropic else (api_key or agent.api_key or "")
+            effective_key = (api_key or getattr(agent, "api_key", "") or resolve_anthropic_token() or "") if _is_native_anthropic else (api_key or getattr(agent, "api_key", "") or "")
 
             # MiniMax OAuth: swap static string for a per-request callable token
             # provider so the rebuilt client survives 15-min token expiry. See
@@ -1481,7 +1481,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             agent.client = None
             agent._client_kwargs = {}
         else:
-            effective_key = api_key or agent.api_key
+            effective_key = api_key or getattr(agent, "api_key", "")
             effective_base = base_url or agent.base_url
             agent._client_kwargs = {
                 "api_key": effective_key,
