@@ -824,6 +824,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
             _notify_session_boundary("on_session_reset", key)
 
             info = _session_info(agent, current)
+            current["_last_info_model"] = getattr(agent, "model", "")
             cfg_warn = _probe_config_health(_load_cfg())
             if cfg_warn:
                 info["config_warning"] = cfg_warn
@@ -4943,6 +4944,22 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             with session["history_lock"]:
                 _clear_inflight_turn(session)
             _emit("message.complete", sid, payload)
+
+            # ── Refresh session.info after turn (routing model swap) ──
+            # If the model router swapped the active model mid-turn, the
+            # TUI status bar still shows the stale model from session init.
+            # Re-emit session.info so model + routing position stay in sync.
+            # Only fire when the model actually changed to avoid the git
+            # subprocess cost of _session_info on every turn.
+            _info_model = session.get("_last_info_model")
+            _agent_model = getattr(agent, "model", "")
+            if _info_model is not None and _info_model != _agent_model:
+                try:
+                    fresh_info = _session_info(agent, session)
+                    _emit("session.info", sid, fresh_info)
+                except Exception:
+                    pass
+            session["_last_info_model"] = _agent_model
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge
