@@ -65,6 +65,17 @@ def get_routing_state(agent: object) -> RoutingState:
             current_position = swap_mgr.current_position
             raw_state = swap_mgr.state
             swap_state = raw_state.name if hasattr(raw_state, "name") else str(raw_state)
+        else:
+            # Swap manager not yet initialized (no routed turn yet).
+            # Infer current position from agent's active model/provider.
+            agent_provider = getattr(agent, "provider", "")
+            agent_model = getattr(agent, "model", "")
+            if agent_provider or agent_model:
+                graph = getattr(config, "graph", None) or {}
+                for name, pos in graph.items():
+                    if pos.provider == agent_provider and pos.model == agent_model:
+                        current_position = name
+                        break
     except Exception:
         pass
 
