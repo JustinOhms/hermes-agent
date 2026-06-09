@@ -8031,6 +8031,14 @@ def _(rid, params: dict) -> dict:
         except Exception as e:
             return _ok(rid, {"output": f"Plugin command error: {e}"})
 
+    # /routing is gateway-only (needs live agent state, not the CLI subprocess)
+    if _cmd_base == "routing":
+        agent = session.get("agent")
+        output = _handle_routing_command(
+            params.get("session_id", ""), session, agent, _cmd_arg
+        )
+        return _ok(rid, {"output": output or "(no output)"})
+
     worker = session.get("slash_worker")
     if not worker:
         try:
