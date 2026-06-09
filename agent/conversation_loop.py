@@ -446,8 +446,8 @@ def run_conversation(
                     routing_decision.reason,
                     routing_decision.swap_required,
                 )
-    except Exception:
-        pass
+    except Exception as _routing_exc:
+        logger.warning("routing phase 1 failed: %s", _routing_exc, exc_info=True)
 
     # ── Model routing: Phase 2 — execute swaps ──
     if routing_decision and routing_decision.swap_required:
@@ -473,8 +473,8 @@ def run_conversation(
                     _effective.model,
                     _effective.provider,
                 )
-        except Exception:
-            pass
+        except Exception as _swap_exc:
+            logger.warning("routing phase 2 swap failed: %s", _swap_exc, exc_info=True)
 
     # Sanitize surrogate characters from user input.  Clipboard paste from
     # rich-text editors (Google Docs, Word, etc.) can inject lone surrogates
