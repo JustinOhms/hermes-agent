@@ -1482,6 +1482,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             agent._client_kwargs = {}
         else:
             effective_key = api_key or getattr(agent, "api_key", "")
+            agent.api_key = effective_key
             effective_base = base_url or agent.base_url
             agent._client_kwargs = {
                 "api_key": effective_key,
@@ -1542,7 +1543,8 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         # string for its live-probe paths; for Foundry the context
         # length normally resolves via config or static catalogs and
         # never hits a probe, but coerce to empty string defensively.
-        _ctx_api_key = agent.api_key if isinstance(agent.api_key, str) else ""
+        _ctx_api_key = getattr(agent, "api_key", "")
+        _ctx_api_key = _ctx_api_key if isinstance(_ctx_api_key, str) else ""
         new_context_length = get_model_context_length(
             agent.model,
             base_url=agent.base_url,
@@ -1555,7 +1557,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             model=agent.model,
             context_length=new_context_length,
             base_url=agent.base_url,
-            api_key=agent.api_key,  # context_compressor forwards to call_llm; callable preserved
+            api_key=getattr(agent, "api_key", ""),  # context_compressor forwards to call_llm; callable preserved
             provider=agent.provider,
             api_mode=agent.api_mode,
         )
