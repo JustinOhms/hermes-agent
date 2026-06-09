@@ -7864,6 +7864,20 @@ def _handle_routing_command(sid: str, session: dict, agent, arg: str) -> str:
         tier_ladder = [p for p in _TIER_ORDER if p in config.graph]
         # If current position isn't in our known ladder, append it
         current_pos = state.current_position
+
+        # If position is unknown, infer from agent's active model/provider
+        if not current_pos and agent:
+            agent_provider = getattr(agent, "provider", "")
+            agent_model = getattr(agent, "model", "")
+            for pos_name, pos_cfg in config.graph.items():
+                if getattr(pos_cfg, "provider", None) == agent_provider and getattr(pos_cfg, "model", None) == agent_model:
+                    current_pos = pos_name
+                    # Also update the swap manager so subsequent calls work
+                    swap_mgr = getattr(agent, "_routing_swap_manager", None)
+                    if swap_mgr is not None:
+                        swap_mgr.set_current_position(pos_name)
+                    break
+
         if current_pos and current_pos not in tier_ladder:
             tier_ladder.append(current_pos)
 
