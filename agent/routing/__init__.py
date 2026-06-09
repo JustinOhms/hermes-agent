@@ -191,13 +191,56 @@ def _get_or_create_swap_manager(agent: object, config: RoutingConfig) -> "SwapMa
 def _init_swap_manager_position(
     mgr: "SwapManager", agent: object, config: RoutingConfig
 ) -> None:
-    """Set swap manager's current position from agent's active model/provider."""
+    """Set swap manager's current position by checking the actual model loaded.
+    
+    Tries to match the currently loaded model (via local server or agent attributes)
+    against the routing graph to determine the correct current position.
+    """
+    import json
+    import urllib.request
+    
+    # First, check if a local model is loaded on :58080
+    try:
+        req = urllib.request.Request("http://127.0.0.1:58080/v1/models")
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json.loads(response.read())
+            local_models = data.get("models", [])
+            if local_models:
+                local_model_name = local_models[0].get("model") or local_models[0].get("name", "")
+                logger.debug("routing: detected local model = %r", local_model_name)
+                # Match against config graph
+                for name, pos in config.graph.items():
+                    if pos.provider == "custom:llm-local" and pos.model == local_model_name:
+                        mgr.set_current_position(name)
+                        logger.info(
+                            "routing: initialized position=%r from local model %r",
+                            name, local_model_name
+                        )
+                        return
+    except Exception as exc:
+        logger.debug("routing: failed to detect local model: %s", exc)
+    
+    # Fallback: use agent's provider/model attributes
     current_provider = getattr(agent, "provider", "")
     current_model = getattr(agent, "model", "")
+    logger.debug("routing: falling back to agent attributes: %s/%s", current_provider, current_model)
     for name, pos in config.graph.items():
         if pos.provider == current_provider and pos.model == current_model:
             mgr.set_current_position(name)
+            logger.info(
+                "routing: initialized position=%r from agent attributes",
+                name
+            )
             return
+    
+    # Last resort: set to first position in graph (usually interactive_lower)
+    if config.graph:
+        first_position = next(iter(config.graph))
+        mgr.set_current_position(first_position)
+        logger.warning(
+            "routing: could not detect model, defaulting to first position=%r",
+            first_position
+        )
 
 
 def _build_context(user_message: str, agent: object, mode: InteractionMode) -> RoutingContext:

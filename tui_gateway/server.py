@@ -8046,8 +8046,47 @@ def _handle_routing_command(sid: str, session: dict, agent, arg: str) -> str:
             lines.append(f"    is_local:  {row.get('is_local', False)}")
         return "\n".join(lines)
 
+    elif subcommand in ("on", "off"):
+        # Toggle routing enabled state
+        try:
+            from hermes_cli.config import load_config, save_config, cfg_get
+            cfg = load_config() or {}
+        except Exception as e:
+            return f"config load failed: {e}"
+
+        # Get current routing config (may be empty)
+        routing_cfg = cfg_get(cfg, "model", "routing") or {}
+        current_enabled = bool(routing_cfg.get("enabled", False))
+
+        if subcommand == "on":
+            new_enabled = True
+            action = "enabled"
+        else:
+            new_enabled = False
+            action = "disabled"
+
+        if current_enabled == new_enabled:
+            return f"Model Routing is already {action}."
+
+        # Update the routing config
+        if not isinstance(routing_cfg, dict):
+            routing_cfg = {}
+        routing_cfg["enabled"] = new_enabled
+
+        # Ensure model.routing exists in cfg
+        if "model" not in cfg:
+            cfg["model"] = {}
+        cfg["model"]["routing"] = routing_cfg
+
+        try:
+            save_config(cfg)
+        except Exception as e:
+            return f"config save failed: {e}"
+
+        return f"✓ Model Routing {action}. Use `/routing status` to verify."
+
     else:
-        return "Usage: /routing [status|graph|swap|upgrade|downgrade|mode|history|oversight|identity]"
+        return "Usage: /routing [status|graph|swap|upgrade|downgrade|mode|history|oversight|identity|on|off]"
 
 
 def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
