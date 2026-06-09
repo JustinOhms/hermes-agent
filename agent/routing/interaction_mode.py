@@ -16,6 +16,8 @@ logger = logging.getLogger(__name__)
 
 
 class InteractionMode(Enum):
+    """Whether the user is actively present (interactive) or away (autonomous)."""
+
     INTERACTIVE = "interactive"
     AUTONOMOUS = "autonomous"
 

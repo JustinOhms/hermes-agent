@@ -22,6 +22,8 @@ _MAX_OBSERVATIONS = 20   # keep only the most recent N observations per position
 
 @dataclass
 class DriftAlert:
+    """Alert emitted when a position's latency/throughput drifts from its profile."""
+
     position: str
     metric: str        # "ttft" or "generation_speed"
     observed: float    # observed value (p90 TTFT ms or p50 tok/s)

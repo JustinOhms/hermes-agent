@@ -82,6 +82,8 @@ _STRUCTURED_DATA_PATTERNS = re.compile(
 # ---------------------------------------------------------------------------
 
 class TurnRouter:
+    """Routes each turn to the appropriate model position based on context signals."""
+
     def __init__(
         self,
         config: "RoutingConfig",

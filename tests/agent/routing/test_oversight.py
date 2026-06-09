@@ -150,39 +150,53 @@ class TestShouldReview:
     def test_disabled(self, config):
         config.enabled = False
         reviewer = OversightReviewer(config)
-        assert not reviewer.should_review(10)
+        should, budget = reviewer.should_review(10)
+        assert not should
 
     def test_budget_exhausted(self, reviewer):
         # Fill up the budget
         for _ in range(3):
             reviewer.reviews.append(OversightResult(action=OversightAction.APPROVE))
-        assert not reviewer.should_review(10)
+        should, budget = reviewer.should_review(10)
+        assert not should
+        assert budget
 
     def test_before_minimum_turns(self, reviewer):
         # min_turns_before_first = 3
-        assert not reviewer.should_review(1)
-        assert not reviewer.should_review(2)
+        should1, _ = reviewer.should_review(1)
+        should2, _ = reviewer.should_review(2)
+        assert not should1
+        assert not should2
 
     def test_not_on_review_turn(self, reviewer):
         # every_n_turns = 5
-        assert not reviewer.should_review(3)
-        assert not reviewer.should_review(4)
-        assert not reviewer.should_review(6)
+        should3, _ = reviewer.should_review(3)
+        should4, _ = reviewer.should_review(4)
+        should6, _ = reviewer.should_review(6)
+        assert not should3
+        assert not should4
+        assert not should6
 
     def test_on_review_turn(self, reviewer):
         # every_n_turns = 5, min_turns = 3
-        assert reviewer.should_review(5)
-        assert reviewer.should_review(10)
-        assert reviewer.should_review(15)
+        should5, _ = reviewer.should_review(5)
+        should10, _ = reviewer.should_review(10)
+        should15, _ = reviewer.should_review(15)
+        assert should5
+        assert should10
+        assert should15
 
     def test_skip_after_escalation(self, reviewer):
-        assert reviewer.should_review(5, last_was_escalated=False)
-        assert not reviewer.should_review(5, last_was_escalated=True)
+        should_yes, _ = reviewer.should_review(5, last_was_escalated=False)
+        should_no, _ = reviewer.should_review(5, last_was_escalated=True)
+        assert should_yes
+        assert not should_no
 
     def test_skip_after_escalation_disabled(self, config):
         config.skip_if_escalated = False
         reviewer = OversightReviewer(config)
-        assert reviewer.should_review(5, last_was_escalated=True)
+        should, _ = reviewer.should_review(5, last_was_escalated=True)
+        assert should
 
 
 # ---------------------------------------------------------------------------
@@ -474,7 +488,8 @@ class TestRunOversightIfDue:
 
         result = run_oversight_if_due(agent, messages, 5)
         assert result is not None
-        assert result.action == OversightAction.APPROVE
+        oversight_result, budget_exhausted = result
+        assert oversight_result.action == OversightAction.APPROVE
 
     @patch("agent.routing.oversight.load_oversight_config")
     def test_not_due_returns_none(self, mock_config):

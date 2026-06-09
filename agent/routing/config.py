@@ -11,6 +11,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class GraphPositionProfile:
+    """Performance profile for a graph position (latency, throughput)."""
+
     startup_latency_s: float = 0.0
     ttft_p50_ms: float = 0.0
     ttft_p90_ms: float = 0.0
@@ -19,6 +21,8 @@ class GraphPositionProfile:
 
 @dataclass
 class GraphPosition:
+    """A named model slot in the routing graph (provider + model + profile)."""
+
     provider: str = ""
     model: str = ""
     profile: GraphPositionProfile = field(default_factory=GraphPositionProfile)
@@ -31,6 +35,8 @@ class GraphPosition:
 
 @dataclass
 class InteractionModeConfig:
+    """Thresholds for interactive vs autonomous mode detection."""
+
     idle_threshold_s: int = 600
     swap_back_messages: int = 3
     swap_back_window_s: int = 60
@@ -38,17 +44,23 @@ class InteractionModeConfig:
 
 @dataclass
 class ComplexityConfig:
+    """Complexity scoring thresholds for escalation/de-escalation decisions."""
+
     escalation_threshold: float = 0.7
     de_escalation_threshold: float = 0.2
 
 
 @dataclass
 class DeEscalationConfig:
+    """Controls whether the router can de-escalate from upper to lower tiers."""
+
     enabled: bool = False
 
 
 @dataclass
 class RoutingConfig:
+    """Top-level routing configuration parsed from model.routing in config.yaml."""
+
     enabled: bool = False
     graph: Dict[str, GraphPosition] = field(default_factory=dict)
     interaction_mode: InteractionModeConfig = field(default_factory=InteractionModeConfig)

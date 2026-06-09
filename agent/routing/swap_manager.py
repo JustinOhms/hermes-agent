@@ -23,6 +23,8 @@ _SWAP_TIMEOUT_S = 30.0
 
 
 class SwapState(Enum):
+    """Lifecycle states for a model swap operation."""
+
     IDLE = "idle"
     AWAITING_ENGAGEMENT = "awaiting_engagement"  # autonomous→interactive, not sustained yet
     SWAP_REQUESTED = "swap_requested"             # sustained engagement confirmed, about to swap
@@ -33,6 +35,8 @@ class SwapState(Enum):
 
 @dataclass
 class SwapResult:
+    """Outcome of a swap attempt (success, timing, or error details)."""
+
     success: bool
     startup_time_s: float = 0.0
     error: str = ""

@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class OversightAction(Enum):
+    """Possible actions an oversight review can recommend."""
+
     APPROVE = "approve"
     CORRECT = "correct"
     ESCALATE = "escalate"
@@ -54,6 +56,8 @@ class OversightResult:
 
 @dataclass
 class OversightConfig:
+    """Configuration for the periodic oversight reviewer."""
+
     enabled: bool = False
     model: str = ""
     provider: str = ""
@@ -157,41 +161,66 @@ class OversightReviewer:
         self.config = config
         self.reviews: List[OversightResult] = []
         self._turn_token_counts: List[int] = []  # rolling window for RD-18
+        self._budget_warning_shown: bool = False  # Track if user was warned about exhausted budget
 
     @property
     def review_count(self) -> int:
+        """Number of reviews performed this session."""
         return len(self.reviews)
 
     @property
     def budget_exhausted(self) -> bool:
+        """True when max_reviews_per_session has been reached."""
         return self.review_count >= self.config.max_reviews_per_session
 
     def should_review(
         self,
         turn_count: int,
         last_was_escalated: bool = False,
-    ) -> bool:
-        """Determine if a review should run at this turn count."""
+        ask_user_if_budget_exhausted: bool = True,
+    ) -> tuple[bool, bool]:
+        """Determine if a review should run at this turn count.
+        
+        Returns:
+            (should_review, budget_exhausted)
+            - should_review: True if review should be attempted
+            - budget_exhausted: True if budget is exhausted (user should be prompted)
+        """
         if not self.config.enabled:
-            return False
+            return (False, False)
 
         if self.budget_exhausted:
-            logger.debug("oversight: budget exhausted (%d/%d reviews)",
-                         self.review_count, self.config.max_reviews_per_session)
-            return False
+            if not self._budget_warning_shown and ask_user_if_budget_exhausted:
+                # First time budget exhausted - prompt user
+                self._budget_warning_shown = True
+                logger.info(
+                    "oversight: budget exhausted (%d/%d reviews). "
+                    "Use /reset-oversight to reset budget or update max_reviews_per_session in config.",
+                    self.review_count, self.config.max_reviews_per_session
+                )
+                # Return (False, True) to signal budget exhausted for UI to handle
+                return (False, True)
+            else:
+                # Budget exhausted and user either declined or not prompted
+                logger.debug(
+                    "oversight: budget exhausted (%d/%d reviews). "
+                    "Use /reset-oversight to reset budget.",
+                    self.review_count, self.config.max_reviews_per_session
+                )
+                return (False, True)
 
         if turn_count < self.config.min_turns_before_first:
-            return False
+            return (False, False)
 
         if last_was_escalated and self.config.skip_if_escalated:
             logger.debug("oversight: skipping — last turn was escalated")
-            return False
+            return (False, False)
 
         # Check if it's a review turn (every N turns)
         if turn_count % self.config.every_n_turns != 0:
-            return False
+            return (False, False)
 
-        return True
+        return (True, False)
 
     def compute_effective_window(self, avg_tokens_per_turn: Optional[float] = None) -> int:
         """Compute the dynamic review window per RD-18.
@@ -420,6 +449,12 @@ class OversightReviewer:
             warning=str(data.get("warning", "")),
         )
 
+    def reset_budget(self) -> None:
+        """Reset the budget and clear all reviews."""
+        self.reviews = []
+        self._budget_warning_shown = False
+        logger.info("oversight: budget reset - reviews cleared")
+
     def get_status(self) -> Dict[str, Any]:
         """Return current oversight status for /routing display."""
         last_review = self.reviews[-1] if self.reviews else None
@@ -470,11 +505,17 @@ def run_oversight_if_due(
     agent: object,
     messages: List[Dict[str, Any]],
     turn_count: int,
-) -> Optional[OversightResult]:
+    ask_user_if_budget_exhausted: bool = True,
+) -> Optional[tuple[OversightResult, bool]]:
     """Check if oversight is due and run it if so.
 
     Called from conversation_loop.py after a turn completes.
-    Returns the OversightResult if a review ran, None otherwise.
+    
+    Returns:
+        (OversightResult, budget_exhausted) if a review ran
+        None if no review was needed or budget exhausted (user needs to be prompted)
+        
+    Side effect: When budget exhausted, sets agent._oversight_budget_exhausted = True
     """
     reviewer = get_or_create_oversight_reviewer(agent)
     if reviewer is None:
@@ -483,7 +524,18 @@ def run_oversight_if_due(
     # Check if last turn was an escalation
     last_was_escalated = getattr(agent, "_oversight_last_escalated", False)
 
-    if not reviewer.should_review(turn_count, last_was_escalated):
+    should_review, budget_exhausted = reviewer.should_review(
+        turn_count, last_was_escalated, ask_user_if_budget_exhausted
+    )
+    
+    if not should_review:
+        if budget_exhausted:
+            # Budget exhausted - signal to prompt user
+            try:
+                setattr(agent, "_oversight_budget_exhausted", True)
+            except Exception:
+                pass
+            return None
         return None
 
     # Compute effective window
@@ -508,7 +560,7 @@ def run_oversight_if_due(
     except Exception:
         pass
 
-    return result
+    return (result, budget_exhausted)
 
 
 def build_oversight_injection(result: OversightResult, oversight_model: str) -> Dict[str, str]:
@@ -558,3 +610,24 @@ def _extract_review_window(
                 break
 
     return messages[start_idx:]
+
+
+def reset_budget_for_agent(agent: object) -> bool:
+    """Reset the budget for an agent's oversight reviewer.
+    
+    Returns True if successful, False if oversight is disabled or no reviewer exists.
+    """
+    try:
+        reviewer = get_or_create_oversight_reviewer(agent)
+        if reviewer is None:
+            return False
+        reviewer.reset_budget()
+        # Clear agent flag
+        try:
+            delattr(agent, "_oversight_budget_exhausted")
+        except AttributeError:
+            pass
+        return True
+    except Exception as exc:
+        logger.warning("Failed to reset oversight budget: %s", exc)
+        return False

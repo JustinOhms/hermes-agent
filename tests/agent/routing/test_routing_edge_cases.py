@@ -335,8 +335,9 @@ class TestOversightEscalationFlag:
             result = run_oversight_if_due(agent, messages, 5)
 
         assert result is not None
-        assert result.action == OversightAction.ESCALATE
-        assert result.reason == "stuck"
+        oversight_result, _ = result
+        assert oversight_result.action == OversightAction.ESCALATE
+        assert oversight_result.reason == "stuck"
 
     def test_skip_review_after_escalation(self):
         """After ESCALATE, next review should be skipped (skip_if_escalated=True)."""
@@ -351,9 +352,12 @@ class TestOversightEscalationFlag:
         )
         reviewer = OversightReviewer(config)
 
-        assert reviewer.should_review(5, last_was_escalated=False)
-        assert not reviewer.should_review(10, last_was_escalated=True)
-        assert reviewer.should_review(15, last_was_escalated=False)
+        should_yes, _ = reviewer.should_review(5, last_was_escalated=False)
+        should_no, _ = reviewer.should_review(10, last_was_escalated=True)
+        should_again, _ = reviewer.should_review(15, last_was_escalated=False)
+        assert should_yes
+        assert not should_no
+        assert should_again
 
     def test_correction_injection_format(self):
         """CORRECT injection should be a system message with proper format."""

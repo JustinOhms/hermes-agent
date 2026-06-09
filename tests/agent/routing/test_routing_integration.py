@@ -231,17 +231,21 @@ class TestOversightLifecycle:
 
         # Turns 1-4: no review
         for turn in range(1, 5):
-            assert not reviewer.should_review(turn, last_was_escalated=False)
+            should, _ = reviewer.should_review(turn, last_was_escalated=False)
+            assert not should
 
         # Turn 5: review
-        assert reviewer.should_review(5, last_was_escalated=False)
+        should5, _ = reviewer.should_review(5, last_was_escalated=False)
+        assert should5
 
         # Turns 6-9: no review
         for turn in range(6, 10):
-            assert not reviewer.should_review(turn, last_was_escalated=False)
+            should, _ = reviewer.should_review(turn, last_was_escalated=False)
+            assert not should
 
         # Turn 10: review
-        assert reviewer.should_review(10, last_was_escalated=False)
+        should10, _ = reviewer.should_review(10, last_was_escalated=False)
+        assert should10
 
     def test_oversight_budget_exhaustion(self):
         """After max_reviews_per_session reviews, no more reviews fire."""
@@ -319,9 +323,10 @@ class TestOversightLifecycle:
             result = run_oversight_if_due(agent, messages, 5)
 
         assert result is not None
-        assert result.action == OversightAction.CORRECT
+        oversight_result, _ = result
+        assert oversight_result.action == OversightAction.CORRECT
 
-        injection = build_oversight_injection(result, "claude-opus-4-6")
+        injection = build_oversight_injection(oversight_result, "claude-opus-4-6")
         assert injection["role"] == "system"
         assert "None input" in injection["content"]
         assert "non-list types" in injection["content"]
@@ -354,7 +359,8 @@ class TestOversightLifecycle:
 
         # Should not crash — defaults to approve on error
         assert result is not None
-        assert result.action == OversightAction.APPROVE
+        oversight_result, _ = result
+        assert oversight_result.action == OversightAction.APPROVE
 
 
 # ---------------------------------------------------------------------------

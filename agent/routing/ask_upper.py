@@ -122,10 +122,12 @@ class AskUpperBudget:
 
     @property
     def exhausted(self) -> bool:
+        """True when hard budget is reached and further calls should be refused."""
         return self.calls >= self.hard_budget_calls
 
     @property
     def over_soft_budget(self) -> bool:
+        """True when soft budget is reached; warn but don't refuse."""
         return self.calls >= self.soft_budget_calls
 
 
