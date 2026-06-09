@@ -7846,6 +7846,64 @@ def _handle_routing_command(sid: str, session: dict, agent, arg: str) -> str:
             return f"✓ Swapped to: {target_position} ({model})"
         return "no active agent to swap"
 
+    elif subcommand in ("upgrade", "downgrade"):
+        # Tier ladder: ordered from lowest to highest capability
+        # Explicit config key or fallback to well-known position name ordering
+        try:
+            from agent.routing.config import load_routing_config
+            config = load_routing_config()
+        except Exception:
+            return "routing config not loaded"
+        if not config or not config.graph:
+            return "no graph configured"
+
+        # Define tier order — positions ordered low → high
+        # Use generation_tok_s as heuristic: faster local = lower tier, cloud = higher
+        _TIER_ORDER = ["fast_fallback", "interactive_lower", "autonomous_lower", "upper"]
+        # Filter to positions actually in the graph
+        tier_ladder = [p for p in _TIER_ORDER if p in config.graph]
+        # If current position isn't in our known ladder, append it
+        current_pos = state.current_position
+        if current_pos and current_pos not in tier_ladder:
+            tier_ladder.append(current_pos)
+
+        if not current_pos or current_pos not in tier_ladder:
+            return f"Cannot {subcommand}: current position unknown ({current_pos})"
+
+        idx = tier_ladder.index(current_pos)
+        if subcommand == "upgrade":
+            if idx >= len(tier_ladder) - 1:
+                return f"Already at highest tier: {current_pos}"
+            target_position = tier_ladder[idx + 1]
+        else:  # downgrade
+            if idx <= 0:
+                return f"Already at lowest tier: {current_pos}"
+            target_position = tier_ladder[idx - 1]
+
+        # Execute the swap (same logic as 'swap' subcommand)
+        pos_cfg = config.graph[target_position]
+        provider = getattr(pos_cfg, "provider", None)
+        model = getattr(pos_cfg, "model", None)
+        base_url = getattr(pos_cfg, "base_url", None)
+        api_key = getattr(pos_cfg, "api_key", None)
+        api_mode = getattr(pos_cfg, "api_mode", None)
+        if agent and hasattr(agent, "switch_model"):
+            agent.switch_model(
+                new_model=model,
+                new_provider=provider,
+                api_key=api_key,
+                base_url=base_url,
+                api_mode=api_mode,
+            )
+            swap_mgr = getattr(agent, "_routing_swap_manager", None)
+            if swap_mgr is not None:
+                swap_mgr.current_position = target_position
+            setattr(agent, "_routing_explicit_override", target_position)
+            _emit("session.info", sid, _session_info(agent))
+            direction = "⬆️" if subcommand == "upgrade" else "⬇️"
+            return f"{direction} {subcommand.title()}: {current_pos} → {target_position} ({model})"
+        return "no active agent to swap"
+
     elif subcommand == "mode":
         if not sub_arg:
             current_override = getattr(agent, "_routing_mode_override", None)
@@ -7907,7 +7965,7 @@ def _handle_routing_command(sid: str, session: dict, agent, arg: str) -> str:
         return "\n".join(lines)
 
     else:
-        return "Usage: /routing [status|graph|swap|mode|history|oversight]"
+        return "Usage: /routing [status|graph|swap|upgrade|downgrade|mode|history|oversight]"
 
 
 def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
