@@ -10,7 +10,9 @@ import pytest
 
 from agent.routing.config import (
     ComplexityConfig,
+    GraphPosition,
     InteractionModeConfig,
+    build_tier_ladder,
     load_routing_config,
 )
 from agent.routing.oversight import (
@@ -283,3 +285,66 @@ class TestAskUpperErrorSanitization:
         assert "ConnectionError" in result
         assert "sk-abc123" not in result
         assert "secret.internal.corp" not in result
+
+
+class TestBuildTierLadder:
+    """Test build_tier_ladder() ordering logic."""
+
+    def _pos(self, tier: int = 0) -> GraphPosition:
+        return GraphPosition(provider="test", model="test-model", tier=tier)
+
+    def test_empty_graph(self):
+        assert build_tier_ladder({}) == []
+
+    def test_well_known_positions_no_tier(self):
+        """Without explicit tiers, falls back to well-known ordering."""
+        graph = {
+            "upper": self._pos(),
+            "fast_fallback": self._pos(),
+            "interactive_lower": self._pos(),
+        }
+        ladder = build_tier_ladder(graph)
+        assert ladder == ["fast_fallback", "interactive_lower", "upper"]
+
+    def test_explicit_tiers(self):
+        """Explicit tier values are used for ordering."""
+        graph = {
+            "upper": self._pos(tier=3),
+            "fast_fallback": self._pos(tier=1),
+            "coder": self._pos(tier=2),
+        }
+        ladder = build_tier_ladder(graph)
+        assert ladder == ["fast_fallback", "coder", "upper"]
+
+    def test_mixed_explicit_and_unset(self):
+        """Positions with tier=0 get synthetic tiers from well-known order."""
+        graph = {
+            "upper": self._pos(tier=100),
+            "fast_fallback": self._pos(),  # tier=0, should get synthetic 10
+            "custom_mid": self._pos(tier=50),
+        }
+        ladder = build_tier_ladder(graph)
+        assert ladder == ["fast_fallback", "custom_mid", "upper"]
+
+    def test_unknown_positions_no_tier(self):
+        """Unknown positions without tier are inserted before upper."""
+        graph = {
+            "upper": self._pos(),
+            "fast_fallback": self._pos(),
+            "my_custom_local": self._pos(),
+        }
+        ladder = build_tier_ladder(graph)
+        # my_custom_local is unknown, should be inserted before upper
+        assert ladder.index("fast_fallback") < ladder.index("my_custom_local")
+        assert ladder.index("my_custom_local") < ladder.index("upper")
+
+    def test_all_custom_positions_with_tiers(self):
+        """Entirely custom position names work with explicit tiers."""
+        graph = {
+            "brain": self._pos(tier=3),
+            "muscle": self._pos(tier=2),
+            "speed": self._pos(tier=1),
+        }
+        ladder = build_tier_ladder(graph)
+        assert ladder == ["speed", "muscle", "brain"]
+

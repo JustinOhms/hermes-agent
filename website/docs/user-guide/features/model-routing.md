@@ -109,6 +109,7 @@ graph:
 | `api_key` | — | API key override (usually resolved from env vars) |
 | `api_mode` | — | `chat_completions` or `messages` |
 | `llm_config_name` | — | Local model preset name (for `llm start <name>`) |
+| `tier` | — | Integer ordering for `/routing upgrade` and `/routing downgrade` (higher = more capable). See [Tier Ordering](#tier-ordering). |
 | `profile.startup_latency_s` | — | Cold-start time in seconds (0 for always-on cloud) |
 | `profile.ttft_p50_ms` | — | Time-to-first-token P50 in milliseconds |
 | `profile.ttft_p90_ms` | — | Time-to-first-token P90 in milliseconds |
@@ -208,6 +209,27 @@ Use `/routing` in a session to inspect the routing system:
 | `/routing upgrade` | Force-swap to upper |
 | `/routing downgrade` | Force-swap to lower |
 
+## Tier Ordering
+
+The `tier` field on each graph position controls what `/routing upgrade` and `/routing downgrade` do. Higher tier = more capable model.
+
+```yaml
+graph:
+  fast_fallback:
+    tier: 1              # lowest — fast, cheap
+    ...
+  interactive_lower:
+    tier: 2
+    ...
+  upper:
+    tier: 3              # highest — most capable
+    ...
+```
+
+When you run `/routing upgrade`, Hermes moves to the next position up the tier ladder. `/routing downgrade` moves down. `/routing graph` displays positions in tier order so you can verify the ladder.
+
+**Backwards compatibility:** If no positions have a `tier` field set, the router falls back to a built-in ordering based on well-known position names (`fast_fallback` < `interactive_lower` < `autonomous_lower` < `upper`). Custom position names without explicit tiers are inserted before `upper`.
+
 ## Full Example
 
 A complete configuration for a 3-position graph (cloud upper, local coder, local fast fallback):
@@ -220,6 +242,7 @@ model:
     enabled: true
     graph:
       upper:
+        tier: 3
         provider: bedrock
         model: us.anthropic.claude-opus-4-6-v1
         display_name: "Claude Opus 4"
@@ -229,6 +252,7 @@ model:
           ttft_p50_ms: 2000
           ttft_p90_ms: 4000
       interactive_lower:
+        tier: 2
         provider: custom:llm-local
         model: qwen3-coder-next
         base_url: http://127.0.0.1:58080/v1
@@ -240,6 +264,7 @@ model:
           ttft_p50_ms: 800
           ttft_p90_ms: 1500
       fast_fallback:
+        tier: 1
         provider: custom:llm-local
         model: qwen3-coder-30b
         base_url: http://127.0.0.1:58080/v1

@@ -7827,12 +7827,20 @@ def _handle_routing_command(sid: str, session: dict, agent, arg: str) -> str:
             return "routing config not loaded"
         if not config or not config.graph:
             return "no graph configured"
-        lines = ["Graph positions:"]
-        for pos_name, pos_cfg in config.graph.items():
+        lines = ["Graph positions (lowest → highest tier):"]
+        try:
+            from agent.routing.config import build_tier_ladder
+            ordered_names = build_tier_ladder(config.graph)
+        except Exception:
+            ordered_names = list(config.graph.keys())
+        for pos_name in ordered_names:
+            pos_cfg = config.graph[pos_name]
             provider = getattr(pos_cfg, "provider", "?")
             model = getattr(pos_cfg, "model", "?")
             profile = getattr(pos_cfg, "profile", None)
             speed = getattr(profile, "generation_tok_s", "?") if profile else "?"
+            tier_val = getattr(pos_cfg, "tier", 0)
+            tier_str = f" tier={tier_val}" if tier_val > 0 else ""
             active = " [ACTIVE]" if pos_name == state.current_position else ""
             disabled = ""
             if pos_name == "fast_fallback":
@@ -7843,7 +7851,7 @@ def _handle_routing_command(sid: str, session: dict, agent, arg: str) -> str:
                         disabled = " [de-escalation disabled]"
                 except Exception:
                     pass
-            lines.append(f"  {pos_name}: {provider} / {model} ({speed} tok/s){active}{disabled}")
+            lines.append(f"  {pos_name}: {provider} / {model} ({speed} tok/s){tier_str}{active}{disabled}")
         return "\n".join(lines)
 
     elif subcommand == "swap":
@@ -7889,21 +7897,16 @@ def _handle_routing_command(sid: str, session: dict, agent, arg: str) -> str:
 
     elif subcommand in ("upgrade", "downgrade"):
         # Tier ladder: ordered from lowest to highest capability
-        # Explicit config key or fallback to well-known position name ordering
+        # Uses explicit `tier` field from graph config, or falls back to well-known ordering
         try:
-            from agent.routing.config import load_routing_config
+            from agent.routing.config import load_routing_config, build_tier_ladder
             config = load_routing_config()
         except Exception:
             return "routing config not loaded"
         if not config or not config.graph:
             return "no graph configured"
 
-        # Define tier order — positions ordered low → high
-        # Use generation_tok_s as heuristic: faster local = lower tier, cloud = higher
-        _TIER_ORDER = ["fast_fallback", "interactive_lower", "autonomous_lower", "upper"]
-        # Filter to positions actually in the graph
-        tier_ladder = [p for p in _TIER_ORDER if p in config.graph]
-        # If current position isn't in our known ladder, append it
+        tier_ladder = build_tier_ladder(config.graph)
         current_pos = state.current_position
 
         # If position is unknown, infer from agent's active model/provider

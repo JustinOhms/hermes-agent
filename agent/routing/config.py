@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +98,7 @@ class GraphPosition:
     api_key: str = ""
     llm_config_name: str = ""  # name for `llm start <name>`; set for local models
     display_name: str = ""     # human-friendly name (e.g. "Claude Opus 4"); used by fingerprint
+    tier: int = 0              # explicit ordering for upgrade/downgrade (higher = more capable)
 
 
 @dataclass
@@ -159,8 +160,62 @@ def _parse_graph(raw: Dict[str, Any]) -> Dict[str, GraphPosition]:
             api_key=str(pos_raw.get("api_key", "")),
             llm_config_name=str(pos_raw.get("llm_config_name", "")),
             display_name=str(pos_raw.get("display_name", "")),
+            tier=_safe_int(pos_raw.get("tier"), default=0, min_val=0),
         )
     return positions
+
+
+# ── Tier ladder for upgrade/downgrade ──────────────────────────────────────
+
+# Fallback ordering when positions have no explicit tier (backwards compat)
+_WELL_KNOWN_TIER_ORDER: List[str] = [
+    "fast_fallback", "interactive_lower", "autonomous_lower", "upper",
+]
+
+
+def build_tier_ladder(graph: Dict[str, "GraphPosition"]) -> List[str]:
+    """Return position names ordered lowest-tier → highest-tier.
+
+    Resolution:
+    1. If all positions have tier=0 (unset), fall back to _WELL_KNOWN_TIER_ORDER
+       filtered to graph keys, with unknown positions appended alphabetically.
+    2. If any position has tier > 0, sort by tier ascending.  Positions with
+       tier=0 (unset) are assigned a synthetic tier based on _WELL_KNOWN_TIER_ORDER
+       to maintain backwards compatibility.
+    """
+    positions = list(graph.keys())
+    if not positions:
+        return []
+
+    # Check if any explicit tier is set
+    has_explicit = any(pos.tier > 0 for pos in graph.values())
+
+    if not has_explicit:
+        # Pure fallback: use well-known ordering + alphabetical for unknowns
+        ladder = [p for p in _WELL_KNOWN_TIER_ORDER if p in graph]
+        unknowns = sorted(p for p in positions if p not in ladder)
+        # Insert unknowns before "upper" if it exists, else append
+        if "upper" in ladder and unknowns:
+            idx = ladder.index("upper")
+            for u in unknowns:
+                ladder.insert(idx, u)
+                idx += 1
+        else:
+            ladder.extend(unknowns)
+        return ladder
+
+    # Explicit tiers present — build synthetic tiers for unset positions
+    def _tier_key(name: str) -> int:
+        explicit = graph[name].tier
+        if explicit > 0:
+            return explicit
+        # Assign synthetic tier from well-known order (10, 20, 30, 40)
+        if name in _WELL_KNOWN_TIER_ORDER:
+            return (_WELL_KNOWN_TIER_ORDER.index(name) + 1) * 10
+        # Unknown position with no tier — place between lower and upper
+        return 25
+    
+    return sorted(positions, key=_tier_key)
 
 
 def load_routing_config(cfg: Optional[Dict[str, Any]] = None) -> RoutingConfig:
