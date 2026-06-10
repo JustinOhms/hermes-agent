@@ -6,7 +6,6 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
-
 from agent.routing.config import GraphPosition, RoutingConfig
 from agent.routing.swap_manager import SwapManager
 
@@ -146,3 +145,35 @@ class TestInitSwapManagerPosition:
             _init_swap_manager_position(mgr, agent, config)
 
         assert mgr._current_position == "upper"
+
+    def test_no_local_positions_skips_http_call(self):
+        """When no local positions configured, HTTP call should not be made."""
+        from agent.routing import _init_swap_manager_position
+
+        # Config with only cloud positions (no llm-local)
+        config = RoutingConfig(enabled=True)
+        config.graph = {
+            "interactive_lower": GraphPosition(
+                provider="openai",
+                model="gpt-4",
+                base_url="https://api.openai.com/v1",
+                api_key="sk-test",
+            ),
+            "upper": GraphPosition(
+                provider="bedrock",
+                model="us.anthropic.claude-opus-4-6-v1",
+            ),
+        }
+        mgr = self._make_mgr()
+        mgr._config = config
+        agent = MagicMock()
+        agent.provider = "openai"
+        agent.model = "gpt-4"
+
+        # Mock HTTP to verify it's NOT called
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            _init_swap_manager_position(mgr, agent, config)
+            mock_urlopen.assert_not_called()
+
+        # Should fall back to first position in graph
+        assert mgr._current_position == "interactive_lower"

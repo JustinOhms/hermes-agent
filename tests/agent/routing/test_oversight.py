@@ -562,3 +562,46 @@ class TestOversightStatus:
         assert len(status["history"]) == 2
         assert status["history"][0]["action"] == "approve"
         assert status["history"][1]["action"] == "correct"
+
+# ── Test _extract_json (Fix #3: non-greedy brace-counting) ────────────────────
+
+
+class TestExtractJson:
+    """Test the _extract_json method handles nested braces correctly."""
+
+    def test_simple_json_object(self, reviewer):
+        """Extract simple JSON object."""
+        content = 'Here is my response: {"action": "approve", "note": "OK"}'
+        result = reviewer._extract_json(content)
+        assert result == {"action": "approve", "note": "OK"}
+
+    def test_nested_braces_in_content(self, reviewer):
+        """Extract JSON with nested braces in note/reason fields."""
+        content = '''{
+  "action": "correct",
+  "note": "Use {x: 1, y: 2} instead of {a: 1, b: 2}",
+  "reason": "The new format uses {x, y} notation"
+}'''
+        result = reviewer._extract_json(content)
+        assert result is not None
+        assert result["action"] == "correct"
+        assert "{x: 1, y: 2}" in result["note"]
+
+    def test_multiple_json_objects_takes_first(self, reviewer):
+        """When multiple JSON objects exist, extract the first valid one."""
+        content = '''First object: {"action": "approve"}
+Second object: {"action": "correct"}'''
+        result = reviewer._extract_json(content)
+        assert result == {"action": "approve"}
+
+    def test_malformed_json_returns_none(self, reviewer):
+        """Return None when content contains no valid JSON object."""
+        content = "This is just text without JSON"
+        result = reviewer._extract_json(content)
+        assert result is None
+
+    def test_unclosed_brace_fallback_to_regex(self, reviewer):
+        """Fallback to non-greedy regex when brace-counting fails."""
+        content = '{"action": "approve"} some text'
+        result = reviewer._extract_json(content)
+        assert result == {"action": "approve"}
