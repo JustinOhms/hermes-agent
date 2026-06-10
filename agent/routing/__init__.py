@@ -11,10 +11,12 @@ import logging
 import time
 from collections import deque
 from typing import Optional
-
 from agent.routing.state import get_routing_state  # noqa: F401 — re-exported
-
-from agent.routing.config import RoutingConfig, load_routing_config
+from agent.routing.config import (
+    RoutingConfig,
+    _load_cached_config,
+    load_routing_config,  # noqa: F401 — backwards compat for tests
+)
 from agent.routing.interaction_mode import InteractionMode, InteractionModeDetector
 from agent.routing.model_resolver import ResolvedModel  # noqa: F401 — re-exported (return type of execute_routing_swap)
 from agent.routing.turn_router import RoutingContext, RoutingDecision, TurnRouter
@@ -31,7 +33,7 @@ def get_routing_decision(agent: object, user_message: str) -> Optional[RoutingDe
     position after a cloud-cover turn).
     """
     try:
-        config = load_routing_config()
+        config = _load_cached_config()
         if not config.enabled:
             return None
 
@@ -100,7 +102,7 @@ def execute_routing_swap(
     Called from conversation_loop.py when routing_decision.swap_required is True.
     """
     try:
-        config = load_routing_config()
+        config = _load_cached_config()
         if not config.enabled:
             return None
 
@@ -199,30 +201,49 @@ def _init_swap_manager_position(
     
     Tries to match the currently loaded model (via local server or agent attributes)
     against the routing graph to determine the correct current position.
+    
+    FIX #3: Validate that the position exists in config.graph before setting it.
+    
+    FIX #4: Skip local HTTP call if no local positions configured.
     """
     import json
     import urllib.request
     
-    # First, check if a local model is loaded on :58080
-    try:
-        req = urllib.request.Request("http://127.0.0.1:58080/v1/models")
-        with urllib.request.urlopen(req, timeout=2) as response:
-            data = json.loads(response.read())
-            local_models = data.get("models", [])
-            if local_models:
-                local_model_name = local_models[0].get("model") or local_models[0].get("name", "")
-                logger.debug("routing: detected local model = %r", local_model_name)
-                # Match against config graph
-                for name, pos in config.graph.items():
-                    if pos.provider == "custom:llm-local" and pos.model == local_model_name:
-                        mgr.set_current_position(name)
-                        logger.info(
-                            "routing: initialized position=%r from local model %r",
-                            name, local_model_name
-                        )
-                        return
-    except Exception as exc:
-        logger.debug("routing: failed to detect local model: %s", exc)
+    # FIX #3: Validate helper - only set valid positions from config graph
+    def _set_valid_position(position: str) -> bool:
+        """Set position only if it exists in config.graph. Returns True if valid."""
+        if position not in config.graph:
+            logger.debug("routing: position %r not in config.graph, skipping", position)
+            return False
+        mgr.set_current_position(position)
+        return True
+    
+    # FIX #4: Skip local HTTP call if no local positions configured
+    has_local = any(pos.provider == "custom:llm-local" for pos in config.graph.values())
+    if not has_local:
+        logger.debug("routing: no local positions configured, skipping local model detection")
+        # Fall through to agent attributes and default position logic
+    else:
+        # First, check if a local model is loaded on :58080
+        try:
+            req = urllib.request.Request("http://127.0.0.1:58080/v1/models")
+            with urllib.request.urlopen(req, timeout=2) as response:
+                data = json.loads(response.read())
+                local_models = data.get("models", [])
+                if local_models:
+                    local_model_name = local_models[0].get("model") or local_models[0].get("name", "")
+                    logger.debug("routing: detected local model = %r", local_model_name)
+                    # Match against config graph
+                    for name, pos in config.graph.items():
+                        if pos.provider == "custom:llm-local" and pos.model == local_model_name:
+                            if _set_valid_position(name):
+                                logger.info(
+                                    "routing: initialized position=%r from local model %r",
+                                    name, local_model_name
+                                )
+                            return
+        except Exception as exc:
+            logger.debug("routing: failed to detect local model: %s", exc)
     
     # Fallback: use agent's provider/model attributes
     current_provider = getattr(agent, "provider", "")
@@ -230,21 +251,21 @@ def _init_swap_manager_position(
     logger.debug("routing: falling back to agent attributes: %s/%s", current_provider, current_model)
     for name, pos in config.graph.items():
         if pos.provider == current_provider and pos.model == current_model:
-            mgr.set_current_position(name)
-            logger.info(
-                "routing: initialized position=%r from agent attributes",
-                name
-            )
+            if _set_valid_position(name):
+                logger.info(
+                    "routing: initialized position=%r from agent attributes",
+                    name
+                )
             return
     
     # Last resort: set to first position in graph (usually interactive_lower)
     if config.graph:
         first_position = next(iter(config.graph))
-        mgr.set_current_position(first_position)
-        logger.warning(
-            "routing: could not detect model, defaulting to first position=%r",
-            first_position
-        )
+        if _set_valid_position(first_position):
+            logger.warning(
+                "routing: could not detect model, defaulting to first position=%r",
+                first_position
+            )
 
 
 def _build_context(user_message: str, agent: object, mode: InteractionMode) -> RoutingContext:

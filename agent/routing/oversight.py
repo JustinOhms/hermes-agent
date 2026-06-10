@@ -76,7 +76,7 @@ class OversightConfig:
 
 def load_oversight_config(cfg: Optional[Dict[str, Any]] = None) -> OversightConfig:
     """Load oversight config from model.routing.oversight section."""
-    from agent.routing.config import _load_section
+    from agent.routing.config import _load_section, _safe_int, _safe_float
 
     oversight_raw = _load_section(cfg, "model", "routing", "oversight")
     if not isinstance(oversight_raw, dict):
@@ -88,16 +88,16 @@ def load_oversight_config(cfg: Optional[Dict[str, Any]] = None) -> OversightConf
         provider=str(oversight_raw.get("provider", "")),
         base_url=str(oversight_raw.get("base_url", "")),
         api_key=str(oversight_raw.get("api_key", "")),
-        every_n_turns=int(oversight_raw.get("every_n_turns", 10)),
-        review_window=int(oversight_raw.get("review_window", 10)),
-        review_window_ctx_fraction=float(
-            oversight_raw.get("review_window_ctx_fraction", 0.6)
+        every_n_turns=_safe_int(oversight_raw.get("every_n_turns"), 10, min_val=1),
+        review_window=_safe_int(oversight_raw.get("review_window"), 10, min_val=1),
+        review_window_ctx_fraction=_safe_float(
+            oversight_raw.get("review_window_ctx_fraction"), 0.6, min_val=0.0
         ),
-        review_window_min=int(oversight_raw.get("review_window_min", 2)),
-        max_reviews_per_session=int(oversight_raw.get("max_reviews_per_session", 5)),
-        min_turns_before_first=int(oversight_raw.get("min_turns_before_first", 5)),
+        review_window_min=_safe_int(oversight_raw.get("review_window_min"), 2, min_val=1),
+        max_reviews_per_session=_safe_int(oversight_raw.get("max_reviews_per_session"), 5, min_val=0),
+        min_turns_before_first=_safe_int(oversight_raw.get("min_turns_before_first"), 5, min_val=1),
         skip_if_escalated=bool(oversight_raw.get("skip_if_escalated", True)),
-        upper_context_limit=int(oversight_raw.get("upper_context_limit", 200000)),
+        upper_context_limit=_safe_int(oversight_raw.get("upper_context_limit"), 200000, min_val=10000),
     )
 
 
@@ -406,21 +406,12 @@ class OversightReviewer:
                 lines = lines[:-1]
             content = "\n".join(lines).strip()
 
+        # Try direct JSON parsing first
         try:
             data = json.loads(content)
         except json.JSONDecodeError:
-            # Try to extract JSON from the response
-            import re
-            # Greedy matching to handle nested braces in note/reason fields
-            json_match = re.search(r'\{.*\}', content, re.DOTALL)
-            if json_match:
-                try:
-                    data = json.loads(json_match.group())
-                except json.JSONDecodeError:
-                    logger.warning("oversight: could not parse response: %s", content[:200])
-                    return OversightResult(action=OversightAction.APPROVE)
-            else:
-                logger.warning("oversight: no JSON in response: %s", content[:200])
+            data = self._extract_json(content)
+            if data is None:
                 return OversightResult(action=OversightAction.APPROVE)
 
         action_str = data.get("action", "approve")
@@ -436,6 +427,38 @@ class OversightReviewer:
             reason=str(data.get("reason", "")),
             warning=str(data.get("warning", "")),
         )
+
+    def _extract_json(self, content: str) -> Optional[Dict[str, Any]]:
+        """Extract first valid JSON object from content using brace-counting."""
+        import re
+        
+        # FIX #5: Use brace-counting to find the first valid JSON object
+        # This handles nested braces in note/reason fields correctly
+        brace_count = 0
+        start_idx = None
+        for i, char in enumerate(content):
+            if char == '{':
+                if brace_count == 0:
+                    start_idx = i
+                brace_count += 1
+            elif char == '}':
+                brace_count -= 1
+                if brace_count == 0 and start_idx is not None:
+                    try:
+                        return json.loads(content[start_idx:i+1])
+                    except json.JSONDecodeError:
+                        pass
+        
+        # Fallback: try non-greedy regex
+        json_match = re.search(r'\{.*?\}', content, re.DOTALL)
+        if json_match:
+            try:
+                return json.loads(json_match.group())
+            except json.JSONDecodeError:
+                pass
+        
+        logger.warning("oversight: could not extract JSON from: %s", content[:200])
+        return None
 
     def reset_budget(self) -> None:
         """Reset the budget and clear all reviews."""

@@ -1,12 +1,28 @@
 """RoutingConfig dataclass — parses model.routing section of config.yaml."""
 
 from __future__ import annotations
-
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# ── Module-level cache for load_routing_config() with 30s TTL ────────────────
+_CONFIG_CACHE: dict = {"timestamp": 0.0, "config": None}
+_CONFIG_TTL: int = 30
+
+
+def _load_cached_config() -> RoutingConfig:
+    """Load routing config with 30-second cache TTL.
+    
+    Returns the cached config if valid, otherwise reloads from disk.
+    """
+    now = time.time()
+    if now - _CONFIG_CACHE["timestamp"] > _CONFIG_TTL:
+        _CONFIG_CACHE["config"] = load_routing_config()
+        _CONFIG_CACHE["timestamp"] = now
+    return _CONFIG_CACHE["config"]
 
 
 def _load_section(cfg: Optional[Dict[str, Any]], *path: str) -> Dict[str, Any]:

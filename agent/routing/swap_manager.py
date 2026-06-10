@@ -97,61 +97,62 @@ class SwapManager:
 
         Thread safety: called only from the main conversation thread
         (single-threaded turn processing). No concurrent should_swap() calls.
+
+        CRITICAL: Hold lock for the ENTIRE decision logic to prevent race
+        conditions where a background thread modifies state between lock releases.
         """
         from agent.routing.interaction_mode import InteractionMode
 
         target = decision.target_position
 
+        # CRITICAL FIX #1: Hold lock for the ENTIRE decision logic
+        # Snapshot all needed state in a single critical section and mutate directly
         with self._lock:
             current = self._current_position
             state = self._state
 
-        if current is None or target == current:
-            return False
+            if current is None or target == current:
+                return False
 
-        # Reset from a previous failure so the next cycle can retry
-        if state == SwapState.FAILED:
-            with self._lock:
+            # Reset from a previous failure so the next cycle can retry
+            if state == SwapState.FAILED:
                 self._state = SwapState.IDLE
                 state = SwapState.IDLE
 
-        # Escalation to upper model: always immediate
-        if target == "upper":
-            return True
+            # Escalation to upper model: always immediate
+            if target == "upper":
+                return True
 
-        # Autonomous→interactive transition (lazy swap-back, RD-16)
-        is_auto_to_interactive = (
-            decision.interaction_mode == InteractionMode.INTERACTIVE
-            and current is not None
-            and "autonomous" in current
-        )
+            # Autonomous→interactive transition (lazy swap-back, RD-16)
+            is_auto_to_interactive = (
+                decision.interaction_mode == InteractionMode.INTERACTIVE
+                and current is not None
+                and "autonomous" in current
+            )
 
-        if is_auto_to_interactive:
-            if state == SwapState.AWAITING_ENGAGEMENT:
-                if mode_detector.sustained_engagement_detected():
-                    with self._lock:
+            if is_auto_to_interactive:
+                if state == SwapState.AWAITING_ENGAGEMENT:
+                    if mode_detector.sustained_engagement_detected():
                         self._state = SwapState.SWAP_REQUESTED
                         self._pending_position = target
-                    return True
-                return False
-            elif state not in (SwapState.SWAPPING,):
-                with self._lock:
+                        return True
+                    return False
+                elif state not in (SwapState.SWAPPING,):
                     self._state = SwapState.AWAITING_ENGAGEMENT
                     self._pending_position = target
-                return False
-            # If SWAPPING, fall through to return True (keep routing to cloud cover)
+                    return False
+                # If SWAPPING, fall through to return True (keep routing to cloud cover)
 
-        # Still waiting for sustained engagement from a previous cycle
-        if state == SwapState.AWAITING_ENGAGEMENT:
-            if mode_detector.sustained_engagement_detected():
-                with self._lock:
+            # Still waiting for sustained engagement from a previous cycle
+            if state == SwapState.AWAITING_ENGAGEMENT:
+                if mode_detector.sustained_engagement_detected():
                     self._state = SwapState.SWAP_REQUESTED
                     self._pending_position = target
-                return True
-            return False
+                    return True
+                return False
 
-        # Default: swap immediately
-        return True
+            # Default: swap immediate
+            return True
 
     # ── Effective model resolution ───────────────────────────────────────────
 

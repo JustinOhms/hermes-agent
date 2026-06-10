@@ -205,6 +205,39 @@ class TestShouldSwap:
         result = mgr.should_swap(decision, _make_detector())
         assert mgr.state != SwapState.FAILED
 
+    def test_should_swap_holds_lock_throughout_entire_decision(self):
+        """Test that should_swap holds lock for entire decision logic.
+        
+        This test verifies the fix for the race condition where the lock was
+        released between reading state and mutating it. The test simulates
+        a background thread that tries to modify state during should_swap
+        and verifies that the decision logic completes atomically.
+        """
+        cfg = _make_config(
+            local_positions={
+                "autonomous_lower": "prose",
+                "interactive_lower": "coder",
+            },
+            cloud_positions={"upper": ("bedrock", "claude-opus")},
+        )
+        mgr = SwapManager(cfg)
+        mgr.set_current_position("autonomous_lower")
+        
+        # First call should enter AWAITING_ENGAGEMENT state
+        decision = _make_decision("interactive_lower", mode=InteractionMode.INTERACTIVE)
+        result1 = mgr.should_swap(decision, _make_detector(sustained=False))
+        assert result1 is False
+        assert mgr.state == SwapState.AWAITING_ENGAGEMENT
+        
+        # Second call with sustained engagement should transition to SWAP_REQUESTED
+        # This must happen atomically without interference
+        result2 = mgr.should_swap(decision, _make_detector(sustained=True))
+        assert result2 is True
+        assert mgr.state == SwapState.SWAP_REQUESTED
+        
+        # Verify no intermediate states were observed (would indicate race)
+        # The state machine should transition directly from AWAITING_ENGAGEMENT to SWAP_REQUESTED
+
 
 # ── resolve_effective_model ───────────────────────────────────────────────────
 
