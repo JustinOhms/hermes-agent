@@ -167,55 +167,65 @@ def _parse_graph(raw: Dict[str, Any]) -> Dict[str, GraphPosition]:
 
 # ── Tier ladder for upgrade/downgrade ──────────────────────────────────────
 
-# Fallback ordering when positions have no explicit tier (backwards compat)
-_WELL_KNOWN_TIER_ORDER: List[str] = [
-    "fast_fallback", "interactive_lower", "autonomous_lower", "upper",
-]
 
-
-def build_tier_ladder(graph: Dict[str, "GraphPosition"]) -> List[str]:
+def build_tier_ladder(graph: Dict[str, "GraphPosition"]) -> Optional[List[str]]:
     """Return position names ordered lowest-tier → highest-tier.
 
-    Resolution:
-    1. If all positions have tier=0 (unset), fall back to _WELL_KNOWN_TIER_ORDER
-       filtered to graph keys, with unknown positions appended alphabetically.
-    2. If any position has tier > 0, sort by tier ascending.  Positions with
-       tier=0 (unset) are assigned a synthetic tier based on _WELL_KNOWN_TIER_ORDER
-       to maintain backwards compatibility.
+    Returns None if any position has tier=0 (unset), meaning upgrade/downgrade
+    is disabled until tiers are assigned (manually or via auto_assign_tiers).
     """
     positions = list(graph.keys())
     if not positions:
-        return []
+        return None
 
-    # Check if any explicit tier is set
-    has_explicit = any(pos.tier > 0 for pos in graph.values())
+    # All positions must have explicit tier > 0
+    if any(pos.tier == 0 for pos in graph.values()):
+        return None
 
-    if not has_explicit:
-        # Pure fallback: use well-known ordering + alphabetical for unknowns
-        ladder = [p for p in _WELL_KNOWN_TIER_ORDER if p in graph]
-        unknowns = sorted(p for p in positions if p not in ladder)
-        # Insert unknowns before "upper" if it exists, else append
-        if "upper" in ladder and unknowns:
-            idx = ladder.index("upper")
-            for u in unknowns:
-                ladder.insert(idx, u)
-                idx += 1
+    return sorted(positions, key=lambda name: graph[name].tier)
+
+
+def auto_assign_tiers(graph: Dict[str, "GraphPosition"]) -> Dict[str, int]:
+    """Score each position and assign tier values (1 = lowest, N = highest).
+
+    Scoring heuristic (higher score → higher tier):
+      - Cloud positions score higher than local (cloud models are generally
+        more capable but slower/costlier).
+      - Within the same locality class, lower generation speed (tok/s) implies
+        larger/more capable model → higher tier.
+      - TTFT is used as a tiebreaker: higher TTFT → more compute → higher tier.
+
+    The intent is: fast-cheap-local models get low tiers, slow-expensive-cloud
+    models get high tiers — matching the typical capability ordering.
+
+    Returns a dict mapping position name → assigned tier (1-indexed).
+    """
+    if not graph:
+        return {}
+
+    def _score(pos: "GraphPosition") -> float:
+        """Composite score: higher = more capable (higher tier)."""
+        is_local = is_local_position(pos.base_url, pos.llm_config_name)
+        # Locality: cloud positions get a large base boost
+        locality_score = 0.0 if is_local else 1000.0
+
+        # Generation speed: slower generally means larger/more capable.
+        # Invert and scale: a 30 tok/s model scores higher than 139 tok/s.
+        gen_speed = pos.profile.generation_tok_s
+        if gen_speed > 0:
+            speed_score = 1000.0 / gen_speed  # 139→7.2, 33→30.3, 80→12.5
         else:
-            ladder.extend(unknowns)
-        return ladder
+            speed_score = 50.0  # unknown → mid-range
 
-    # Explicit tiers present — build synthetic tiers for unset positions
-    def _tier_key(name: str) -> int:
-        explicit = graph[name].tier
-        if explicit > 0:
-            return explicit
-        # Assign synthetic tier from well-known order (10, 20, 30, 40)
-        if name in _WELL_KNOWN_TIER_ORDER:
-            return (_WELL_KNOWN_TIER_ORDER.index(name) + 1) * 10
-        # Unknown position with no tier — place between lower and upper
-        return 25
-    
-    return sorted(positions, key=_tier_key)
+        # TTFT: higher TTFT → more compute → tiebreaker for capability.
+        ttft_score = pos.profile.ttft_p50_ms / 100.0  # 200ms→2, 800ms→8, 2000ms→20
+
+        return locality_score + speed_score + ttft_score
+
+    scored = [(name, _score(pos)) for name, pos in graph.items()]
+    scored.sort(key=lambda x: x[1])
+
+    return {name: tier for tier, (name, _) in enumerate(scored, start=1)}
 
 
 def load_routing_config(cfg: Optional[Dict[str, Any]] = None) -> RoutingConfig:

@@ -11,7 +11,9 @@ import pytest
 from agent.routing.config import (
     ComplexityConfig,
     GraphPosition,
+    GraphPositionProfile,
     InteractionModeConfig,
+    auto_assign_tiers,
     build_tier_ladder,
     load_routing_config,
 )
@@ -294,17 +296,25 @@ class TestBuildTierLadder:
         return GraphPosition(provider="test", model="test-model", tier=tier)
 
     def test_empty_graph(self):
-        assert build_tier_ladder({}) == []
+        assert build_tier_ladder({}) is None
 
-    def test_well_known_positions_no_tier(self):
-        """Without explicit tiers, falls back to well-known ordering."""
+    def test_no_tiers_assigned_returns_none(self):
+        """Without explicit tiers, returns None (upgrade/downgrade disabled)."""
         graph = {
             "upper": self._pos(),
             "fast_fallback": self._pos(),
             "interactive_lower": self._pos(),
         }
-        ladder = build_tier_ladder(graph)
-        assert ladder == ["fast_fallback", "interactive_lower", "upper"]
+        assert build_tier_ladder(graph) is None
+
+    def test_partial_tiers_returns_none(self):
+        """If any position has tier=0, returns None."""
+        graph = {
+            "upper": self._pos(tier=3),
+            "fast_fallback": self._pos(tier=1),
+            "interactive_lower": self._pos(),  # tier=0
+        }
+        assert build_tier_ladder(graph) is None
 
     def test_explicit_tiers(self):
         """Explicit tier values are used for ordering."""
@@ -316,28 +326,6 @@ class TestBuildTierLadder:
         ladder = build_tier_ladder(graph)
         assert ladder == ["fast_fallback", "coder", "upper"]
 
-    def test_mixed_explicit_and_unset(self):
-        """Positions with tier=0 get synthetic tiers from well-known order."""
-        graph = {
-            "upper": self._pos(tier=100),
-            "fast_fallback": self._pos(),  # tier=0, should get synthetic 10
-            "custom_mid": self._pos(tier=50),
-        }
-        ladder = build_tier_ladder(graph)
-        assert ladder == ["fast_fallback", "custom_mid", "upper"]
-
-    def test_unknown_positions_no_tier(self):
-        """Unknown positions without tier are inserted before upper."""
-        graph = {
-            "upper": self._pos(),
-            "fast_fallback": self._pos(),
-            "my_custom_local": self._pos(),
-        }
-        ladder = build_tier_ladder(graph)
-        # my_custom_local is unknown, should be inserted before upper
-        assert ladder.index("fast_fallback") < ladder.index("my_custom_local")
-        assert ladder.index("my_custom_local") < ladder.index("upper")
-
     def test_all_custom_positions_with_tiers(self):
         """Entirely custom position names work with explicit tiers."""
         graph = {
@@ -347,4 +335,99 @@ class TestBuildTierLadder:
         }
         ladder = build_tier_ladder(graph)
         assert ladder == ["speed", "muscle", "brain"]
+
+
+class TestAutoAssignTiers:
+    """Test auto_assign_tiers() scoring logic."""
+
+    def test_empty_graph(self):
+        assert auto_assign_tiers({}) == {}
+
+    def test_cloud_ranks_above_local(self):
+        """Cloud positions get higher tier than local positions."""
+        graph = {
+            "cloud": GraphPosition(
+                provider="bedrock",
+                model="claude-opus",
+                profile=GraphPositionProfile(generation_tok_s=80, ttft_p50_ms=2000),
+            ),
+            "local": GraphPosition(
+                provider="custom:llm-local",
+                model="qwen3",
+                base_url="http://127.0.0.1:58080/v1",
+                llm_config_name="qwen3",
+                profile=GraphPositionProfile(generation_tok_s=139, ttft_p50_ms=200),
+            ),
+        }
+        result = auto_assign_tiers(graph)
+        assert result["local"] < result["cloud"]
+
+    def test_slower_local_ranks_above_faster_local(self):
+        """Among local models, slower (larger) models get higher tier."""
+        graph = {
+            "fast": GraphPosition(
+                provider="custom:llm-local",
+                model="small-model",
+                base_url="http://127.0.0.1:58080/v1",
+                llm_config_name="fast",
+                profile=GraphPositionProfile(generation_tok_s=139, ttft_p50_ms=200),
+            ),
+            "slow": GraphPosition(
+                provider="custom:llm-local",
+                model="large-model",
+                base_url="http://127.0.0.1:58080/v1",
+                llm_config_name="slow",
+                profile=GraphPositionProfile(generation_tok_s=33, ttft_p50_ms=800),
+            ),
+        }
+        result = auto_assign_tiers(graph)
+        assert result["fast"] < result["slow"]
+
+    def test_three_position_real_world(self):
+        """Real-world 3-position graph produces correct ordering."""
+        graph = {
+            "fast_fallback": GraphPosition(
+                provider="custom:llm-local",
+                model="qwen3-coder-30b",
+                base_url="http://127.0.0.1:58080/v1",
+                llm_config_name="little-qwen",
+                profile=GraphPositionProfile(generation_tok_s=139, ttft_p50_ms=200),
+            ),
+            "interactive_lower": GraphPosition(
+                provider="custom:llm-local",
+                model="qwen3-coder-next",
+                base_url="http://127.0.0.1:58080/v1",
+                llm_config_name="coder-next",
+                profile=GraphPositionProfile(generation_tok_s=33, ttft_p50_ms=800),
+            ),
+            "upper": GraphPosition(
+                provider="bedrock",
+                model="us.anthropic.claude-opus-4-6-v1",
+                profile=GraphPositionProfile(generation_tok_s=80, ttft_p50_ms=2000),
+            ),
+        }
+        result = auto_assign_tiers(graph)
+        # Expected: fast_fallback=1, interactive_lower=2, upper=3
+        assert result["fast_fallback"] == 1
+        assert result["interactive_lower"] == 2
+        assert result["upper"] == 3
+
+    def test_assigns_sequential_tiers(self):
+        """Tiers are always 1-indexed and sequential."""
+        graph = {
+            "a": GraphPosition(
+                provider="p", model="m",
+                profile=GraphPositionProfile(generation_tok_s=100, ttft_p50_ms=100),
+            ),
+            "b": GraphPosition(
+                provider="p", model="m",
+                profile=GraphPositionProfile(generation_tok_s=50, ttft_p50_ms=500),
+            ),
+            "c": GraphPosition(
+                provider="p", model="m",
+                profile=GraphPositionProfile(generation_tok_s=10, ttft_p50_ms=1000),
+            ),
+        }
+        result = auto_assign_tiers(graph)
+        assert sorted(result.values()) == [1, 2, 3]
 

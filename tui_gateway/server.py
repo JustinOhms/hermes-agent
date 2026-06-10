@@ -7832,7 +7832,10 @@ def _handle_routing_command(sid: str, session: dict, agent, arg: str) -> str:
             from agent.routing.config import build_tier_ladder
             ordered_names = build_tier_ladder(config.graph)
         except Exception:
+            ordered_names = None
+        if ordered_names is None:
             ordered_names = list(config.graph.keys())
+            lines = ["Graph positions (tiers not assigned — run /routing calibrate):"]
         for pos_name in ordered_names:
             pos_cfg = config.graph[pos_name]
             provider = getattr(pos_cfg, "provider", "?")
@@ -7897,7 +7900,7 @@ def _handle_routing_command(sid: str, session: dict, agent, arg: str) -> str:
 
     elif subcommand in ("upgrade", "downgrade"):
         # Tier ladder: ordered from lowest to highest capability
-        # Uses explicit `tier` field from graph config, or falls back to well-known ordering
+        # Uses explicit `tier` field from graph config; disabled if tiers unset
         try:
             from agent.routing.config import load_routing_config, build_tier_ladder
             config = load_routing_config()
@@ -7907,6 +7910,12 @@ def _handle_routing_command(sid: str, session: dict, agent, arg: str) -> str:
             return "no graph configured"
 
         tier_ladder = build_tier_ladder(config.graph)
+        if tier_ladder is None:
+            return (
+                "Cannot upgrade/downgrade: tier values not assigned.\n"
+                "Set tier: N on each graph position in config.yaml, or run /routing calibrate "
+                "to auto-assign based on model profiles."
+            )
         current_pos = state.current_position
 
         # If position is unknown, infer from agent's active model/provider
@@ -7923,7 +7932,7 @@ def _handle_routing_command(sid: str, session: dict, agent, arg: str) -> str:
                     break
 
         if current_pos and current_pos not in tier_ladder:
-            tier_ladder.append(current_pos)
+            return f"Cannot {subcommand}: current position '{current_pos}' is not in the tier ladder"
 
         if not current_pos or current_pos not in tier_ladder:
             return f"Cannot {subcommand}: current position unknown ({current_pos})"
@@ -8088,8 +8097,49 @@ def _handle_routing_command(sid: str, session: dict, agent, arg: str) -> str:
 
         return f"✓ Model Routing {action}. Use `/routing status` to verify."
 
+    elif subcommand == "calibrate":
+        # Auto-assign tiers based on model profiles
+        try:
+            from agent.routing.config import load_routing_config, auto_assign_tiers
+            config = load_routing_config()
+        except Exception:
+            return "routing config not loaded"
+        if not config or not config.graph:
+            return "no graph configured"
+
+        assignments = auto_assign_tiers(config.graph)
+        if not assignments:
+            return "calibrate: no positions to score"
+
+        # Write tiers to config via hermes config set
+        import subprocess as _sp
+        lines = ["Tier auto-assignment (based on model profiles):", ""]
+        errors = []
+        for pos_name, tier_val in sorted(assignments.items(), key=lambda x: x[1]):
+            pos = config.graph[pos_name]
+            lines.append(f"  tier {tier_val}: {pos_name} ({pos.display_name or pos.model})")
+            # Persist to config.yaml
+            try:
+                result = _sp.run(
+                    ["hermes", "config", "set", f"model.routing.graph.{pos_name}.tier", str(tier_val)],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if result.returncode != 0:
+                    errors.append(f"  ✗ {pos_name}: {result.stderr.strip()}")
+            except Exception as e:
+                errors.append(f"  ✗ {pos_name}: {e}")
+
+        lines.append("")
+        if errors:
+            lines.append("Errors writing config:")
+            lines.extend(errors)
+        else:
+            lines.append("✓ All tiers written to config.yaml. /routing upgrade and /routing downgrade are now active.")
+
+        return "\n".join(lines)
+
     else:
-        return "Usage: /routing [status|graph|swap|upgrade|downgrade|mode|history|oversight|identity|on|off]"
+        return "Usage: /routing [status|graph|swap|upgrade|downgrade|calibrate|mode|history|oversight|identity|on|off]"
 
 
 def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
