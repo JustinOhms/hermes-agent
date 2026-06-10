@@ -12,11 +12,8 @@ Per ADR-0040 §4, RD-19.
 
 from __future__ import annotations
 
-import json
 import logging
-import time
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -107,28 +104,10 @@ _REQUEST_TYPE_PROMPTS = {
 
 
 # ---------------------------------------------------------------------------
-# Budget tracking
+# Budget tracking (uses shared BudgetTracker)
 # ---------------------------------------------------------------------------
 
-@dataclass
-class AskUpperBudget:
-    """Tracks ask_upper usage per session."""
-    calls: int = 0
-    total_input_tokens: int = 0
-    total_output_tokens: int = 0
-    soft_budget_calls: int = 5  # warn after this many
-    hard_budget_calls: int = 20  # refuse after this many
-    timestamps: List[float] = field(default_factory=list)
-
-    @property
-    def exhausted(self) -> bool:
-        """True when hard budget is reached and further calls should be refused."""
-        return self.calls >= self.hard_budget_calls
-
-    @property
-    def over_soft_budget(self) -> bool:
-        """True when soft budget is reached; warn but don't refuse."""
-        return self.calls >= self.soft_budget_calls
+from agent.routing.budget import BudgetTracker
 
 
 # ---------------------------------------------------------------------------
@@ -159,9 +138,9 @@ class AskUpperTool:
         self.upper_api_key = upper_api_key
         self.max_context_chars = max_context_chars
         self.max_output_tokens = max_output_tokens
-        self.budget = AskUpperBudget(
-            soft_budget_calls=soft_budget,
-            hard_budget_calls=hard_budget,
+        self.budget = BudgetTracker(
+            soft_limit=soft_budget,
+            hard_limit=hard_budget,
         )
 
     def execute(
@@ -177,7 +156,7 @@ class AskUpperTool:
             return (
                 "[ask_upper BUDGET EXHAUSTED] You have used ask_upper "
                 f"{self.budget.calls} times this session (hard limit: "
-                f"{self.budget.hard_budget_calls}). Proceed with your best "
+                f"{self.budget.hard_limit}). Proceed with your best "
                 "judgment for the remainder of this session."
             )
 
@@ -229,20 +208,16 @@ class AskUpperTool:
                 return "[ask_upper ERROR] Upper model returned empty response."
 
             # ── Track budget ──
-            self.budget.calls += 1
-            self.budget.timestamps.append(time.time())
-
-            # Track tokens if available
             usage = getattr(response, "usage", None)
-            if usage:
-                self.budget.total_input_tokens += getattr(usage, "prompt_tokens", 0) or 0
-                self.budget.total_output_tokens += getattr(usage, "completion_tokens", 0) or 0
+            input_tokens = getattr(usage, "prompt_tokens", 0) or 0 if usage else 0
+            output_tokens = getattr(usage, "completion_tokens", 0) or 0 if usage else 0
+            self.budget.record_call(input_tokens=input_tokens, output_tokens=output_tokens)
 
             # ── Append budget warning if over soft limit ──
-            if self.budget.over_soft_budget:
+            if self.budget.over_soft:
                 content += (
                     f"\n\n[NOTE: ask_upper call {self.budget.calls}/"
-                    f"{self.budget.hard_budget_calls}. Consider whether you "
+                    f"{self.budget.hard_limit}. Consider whether you "
                     "can proceed independently.]"
                 )
 
@@ -250,29 +225,22 @@ class AskUpperTool:
                 "ask_upper: type=%s calls=%d/%d",
                 request_type,
                 self.budget.calls,
-                self.budget.hard_budget_calls,
+                self.budget.hard_limit,
             )
             return content
 
         except Exception as exc:
             # Graceful degradation — don't crash the session
-            logger.warning("ask_upper failed: %s", exc)
+            logger.warning("ask_upper failed: %s", type(exc).__name__)
             return (
                 "[ask_upper UNAVAILABLE] The upper model could not be reached. "
-                f"Error: {exc}\n\n"
+                f"Error: {type(exc).__name__}\n\n"
                 "Proceed with your best judgment."
             )
 
     def get_status(self) -> Dict[str, Any]:
         """Return current budget status for /routing display."""
-        return {
-            "calls": self.budget.calls,
-            "soft_budget": self.budget.soft_budget_calls,
-            "hard_budget": self.budget.hard_budget_calls,
-            "total_input_tokens": self.budget.total_input_tokens,
-            "total_output_tokens": self.budget.total_output_tokens,
-            "exhausted": self.budget.exhausted,
-        }
+        return self.budget.get_status()
 
 
 # ---------------------------------------------------------------------------

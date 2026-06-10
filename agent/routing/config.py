@@ -9,6 +9,73 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 
+def _load_section(cfg: Optional[Dict[str, Any]], *path: str) -> Dict[str, Any]:
+    """Safely extract a nested config section.
+
+    Handles both hermes_cli.config.cfg_get() (when available) and manual
+    dict traversal as fallback.  Used by load_routing_config() and
+    load_oversight_config() to avoid duplicating the load-from-disk dance.
+    """
+    if cfg is None:
+        try:
+            from hermes_cli.config import load_config
+            cfg = load_config() or {}
+        except Exception:
+            return {}
+
+    try:
+        from hermes_cli.config import cfg_get
+        return cfg_get(cfg, *path) or {}
+    except Exception:
+        # Manual traversal
+        node: Any = cfg
+        for key in path:
+            if not isinstance(node, dict):
+                return {}
+            node = node.get(key)
+            if node is None:
+                return {}
+        return node if isinstance(node, dict) else {}
+
+
+def _safe_int(value: Any, default: int, min_val: int = 1) -> int:
+    """Safely convert value to int with bounds checking."""
+    if value is None:
+        return default
+    try:
+        result = int(value)
+        return max(min_val, result) if result < min_val else result
+    except (ValueError, TypeError):
+        logger.warning("config: invalid int value %r, using default %d", value, default)
+        return default
+
+
+def _safe_float(value: Any, default: float, min_val: float = 0.0) -> float:
+    """Safely convert value to float with bounds checking."""
+    if value is None:
+        return default
+    try:
+        result = float(value)
+        return max(min_val, result) if result < min_val else result
+    except (ValueError, TypeError):
+        logger.warning("config: invalid float value %r, using default %.2f", value, default)
+        return default
+
+
+def is_local_position(base_url: str = "", llm_config_name: str = "") -> bool:
+    """Determine if a routing position targets the local LLM server.
+
+    Shared by model_resolver, fingerprint, and __init__.py to avoid
+    inconsistent is_local heuristics scattered across modules.
+    """
+    if llm_config_name:
+        return True
+    if base_url and ("127.0.0.1" in base_url or "localhost" in base_url):
+        return True
+    return False
+
+
+
 @dataclass
 class GraphPositionProfile:
     """Performance profile for a graph position (latency, throughput)."""
@@ -70,10 +137,10 @@ class RoutingConfig:
 
 def _parse_profile(raw: Dict[str, Any]) -> GraphPositionProfile:
     return GraphPositionProfile(
-        startup_latency_s=float(raw.get("startup_latency_s", 0.0)),
-        ttft_p50_ms=float(raw.get("ttft_p50_ms", 0.0)),
-        ttft_p90_ms=float(raw.get("ttft_p90_ms", 0.0)),
-        generation_tok_s=float(raw.get("generation_tok_s", 0.0)),
+        startup_latency_s=_safe_float(raw.get("startup_latency_s"), 0.0, min_val=0.0),
+        ttft_p50_ms=_safe_float(raw.get("ttft_p50_ms"), 0.0, min_val=0.0),
+        ttft_p90_ms=_safe_float(raw.get("ttft_p90_ms"), 0.0, min_val=0.0),
+        generation_tok_s=_safe_float(raw.get("generation_tok_s"), 0.0, min_val=0.0),
     )
 
 
@@ -103,20 +170,7 @@ def load_routing_config(cfg: Optional[Dict[str, Any]] = None) -> RoutingConfig:
         cfg: Already-loaded config dict. If None, loads from config.yaml via
              hermes_cli.config.load_config().
     """
-    if cfg is None:
-        try:
-            from hermes_cli.config import load_config
-            cfg = load_config() or {}
-        except Exception as exc:
-            logger.debug("load_routing_config: could not load config: %s", exc)
-            cfg = {}
-
-    try:
-        from hermes_cli.config import cfg_get
-        routing_raw = cfg_get(cfg, "model", "routing") or {}
-    except Exception:
-        routing_raw = (cfg.get("model") or {}).get("routing") or {}
-
+    routing_raw = _load_section(cfg, "model", "routing")
     if not isinstance(routing_raw, dict):
         return RoutingConfig()
 
@@ -125,15 +179,15 @@ def load_routing_config(cfg: Optional[Dict[str, Any]] = None) -> RoutingConfig:
 
     im_raw = routing_raw.get("interaction_mode") or {}
     interaction_mode = InteractionModeConfig(
-        idle_threshold_s=int(im_raw.get("idle_threshold_s", 600)),
-        swap_back_messages=int(im_raw.get("swap_back_messages", 3)),
-        swap_back_window_s=int(im_raw.get("swap_back_window_s", 60)),
+        idle_threshold_s=_safe_int(im_raw.get("idle_threshold_s"), 600, min_val=1),
+        swap_back_messages=_safe_int(im_raw.get("swap_back_messages"), 3, min_val=1),
+        swap_back_window_s=_safe_int(im_raw.get("swap_back_window_s"), 60, min_val=1),
     )
 
     cplx_raw = routing_raw.get("complexity") or {}
     complexity = ComplexityConfig(
-        escalation_threshold=float(cplx_raw.get("escalation_threshold", 0.7)),
-        de_escalation_threshold=float(cplx_raw.get("de_escalation_threshold", 0.2)),
+        escalation_threshold=_safe_float(cplx_raw.get("escalation_threshold"), 0.7, min_val=0.0),
+        de_escalation_threshold=_safe_float(cplx_raw.get("de_escalation_threshold"), 0.2, min_val=0.0),
     )
 
     de_raw = routing_raw.get("de_escalation") or {}

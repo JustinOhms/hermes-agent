@@ -16,6 +16,7 @@ from agent.routing.state import get_routing_state  # noqa: F401 — re-exported
 
 from agent.routing.config import RoutingConfig, load_routing_config
 from agent.routing.interaction_mode import InteractionMode, InteractionModeDetector
+from agent.routing.model_resolver import ResolvedModel  # noqa: F401 — re-exported (return type of execute_routing_swap)
 from agent.routing.turn_router import RoutingContext, RoutingDecision, TurnRouter
 
 logger = logging.getLogger(__name__)
@@ -90,7 +91,7 @@ def get_routing_decision(agent: object, user_message: str) -> Optional[RoutingDe
 
 def execute_routing_swap(
     agent: object, decision: RoutingDecision
-) -> Optional["ResolvedModel"]:  # noqa: F821
+) -> Optional[ResolvedModel]:
     """Execute a model swap based on the routing decision.
 
     Returns the ResolvedModel that should handle THIS turn, or None if the agent
@@ -159,33 +160,36 @@ def execute_routing_swap(
 # ── Internal helpers ────────────────────────────────────────────────────────
 
 
-def _get_or_create_detector(agent: object, config: RoutingConfig) -> InteractionModeDetector:
-    """Retrieve or create the InteractionModeDetector cached on the agent."""
-    attr = "_routing_mode_detector"
-    detector = getattr(agent, attr, None)
-    if detector is None:
-        detector = InteractionModeDetector(config)
+def _cached_on_agent(agent: object, attr: str, factory):
+    """Retrieve a cached object from the agent, or create and cache it."""
+    obj = getattr(agent, attr, None)
+    if obj is None:
+        obj = factory()
         try:
-            setattr(agent, attr, detector)
+            setattr(agent, attr, obj)
         except Exception:
             pass
-    return detector
+    return obj
+
+
+def _get_or_create_detector(agent: object, config: RoutingConfig) -> InteractionModeDetector:
+    """Retrieve or create the InteractionModeDetector cached on the agent."""
+    return _cached_on_agent(
+        agent, "_routing_mode_detector",
+        lambda: InteractionModeDetector(config),
+    )
 
 
 def _get_or_create_swap_manager(agent: object, config: RoutingConfig) -> "SwapManager":
     """Retrieve or create the SwapManager cached on the agent (singleton per session)."""
     from agent.routing.swap_manager import SwapManager
 
-    attr = "_routing_swap_manager"
-    mgr = getattr(agent, attr, None)
-    if mgr is None:
+    def _factory():
         mgr = SwapManager(config)
         _init_swap_manager_position(mgr, agent, config)
-        try:
-            setattr(agent, attr, mgr)
-        except Exception:
-            pass
-    return mgr
+        return mgr
+
+    return _cached_on_agent(agent, "_routing_swap_manager", _factory)
 
 
 def _init_swap_manager_position(
@@ -202,7 +206,7 @@ def _init_swap_manager_position(
     # First, check if a local model is loaded on :58080
     try:
         req = urllib.request.Request("http://127.0.0.1:58080/v1/models")
-        with urllib.request.urlopen(req, timeout=5) as response:
+        with urllib.request.urlopen(req, timeout=2) as response:
             data = json.loads(response.read())
             local_models = data.get("models", [])
             if local_models:

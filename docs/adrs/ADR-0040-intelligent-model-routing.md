@@ -485,6 +485,9 @@ When it returns `"escalate"`:
 
 ## Implementation Plan
 
+> **Phases implemented in this PR:** 1, 2, 2.5, 3, and 3b (decision history +
+> `/routing` state aggregation). Phases 4–5 are future work.
+
 ### Phase 1: Turn Router (foundation)
 
 1. Create `agent/model_router.py` — `TurnRouter` class with heuristic scoring

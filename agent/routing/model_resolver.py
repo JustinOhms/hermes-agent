@@ -85,8 +85,5 @@ class ModelResolver:
     @staticmethod
     def _is_local(base_url: str, llm_config_name: str) -> bool:
         """Determine if a position uses the local llm server."""
-        if llm_config_name:
-            return True
-        if base_url and "127.0.0.1" in base_url:
-            return True
-        return False
+        from agent.routing.config import is_local_position
+        return is_local_position(base_url, llm_config_name)

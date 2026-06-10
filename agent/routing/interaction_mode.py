@@ -39,6 +39,7 @@ class InteractionModeDetector:
         self._config = config
         self._last_user_message_ts: Optional[float] = None
         self._consecutive_agent_turns: int = 0
+        self._last_mode: Optional[InteractionMode] = None
         # Timestamps of recent user messages within the swap-back window
         self._recent_user_message_ts: deque[float] = deque()
 
@@ -63,14 +64,17 @@ class InteractionModeDetector:
         # 1. Explicit override
         if context.explicit_mode_override == "autonomous":
             logger.debug("interaction_mode: explicit override → autonomous")
+            self._last_mode = InteractionMode.AUTONOMOUS
             return InteractionMode.AUTONOMOUS
         if context.explicit_mode_override == "interactive":
             logger.debug("interaction_mode: explicit override → interactive")
+            self._last_mode = InteractionMode.INTERACTIVE
             return InteractionMode.INTERACTIVE
 
         # 2. Cron/scheduled context
         if context.is_cron:
             logger.debug("interaction_mode: cron context → autonomous")
+            self._last_mode = InteractionMode.AUTONOMOUS
             return InteractionMode.AUTONOMOUS
 
         # 3. Platform signals (stub — no platform-specific offline detection yet)
@@ -85,6 +89,7 @@ class InteractionModeDetector:
                     idle_s,
                     self._config.interaction_mode.idle_threshold_s,
                 )
+                self._last_mode = InteractionMode.AUTONOMOUS
                 return InteractionMode.AUTONOMOUS
 
         # 5. Consecutive agent turns
@@ -93,9 +98,12 @@ class InteractionModeDetector:
                 "interaction_mode: %d consecutive agent turns → autonomous",
                 self._consecutive_agent_turns,
             )
+            self._last_mode = InteractionMode.AUTONOMOUS
             return InteractionMode.AUTONOMOUS
 
-        return InteractionMode.INTERACTIVE
+        mode = InteractionMode.INTERACTIVE
+        self._last_mode = mode
+        return mode
 
     def sustained_engagement_detected(self) -> bool:
         """True if user sent N messages within the swap-back window (RD-16)."""

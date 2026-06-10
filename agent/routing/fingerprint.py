@@ -17,6 +17,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from agent.routing.config import is_local_position
+
 logger = logging.getLogger(__name__)
 
 
@@ -188,7 +190,7 @@ def resolve_fingerprint(agent: object) -> ModelFingerprint:
     model_id = getattr(agent, "model", "") or ""
     provider = getattr(agent, "provider", "") or ""
     base_url = getattr(agent, "base_url", "") or ""
-    is_local = bool("127.0.0.1" in base_url or "localhost" in base_url)
+    is_local = is_local_position(base_url)
 
     position = _resolve_position(agent)
 
@@ -244,7 +246,7 @@ def get_fingerprint_table(agent: object) -> List[Dict[str, Any]]:
                 pos_model = pos_cfg.model
                 pos_provider = pos_cfg.provider
                 pos_base_url = pos_cfg.base_url or ""
-                pos_is_local = bool(pos_cfg.llm_config_name or "127.0.0.1" in pos_base_url)
+                pos_is_local = is_local_position(pos_base_url, pos_cfg.llm_config_name)
 
                 # Resolve display name
                 graph_display = getattr(pos_cfg, "display_name", "") if hasattr(pos_cfg, "display_name") else ""

@@ -41,6 +41,7 @@ class RoutingDecision:
     interaction_mode: "InteractionMode"
     reason: str
     swap_required: bool
+    _timestamp: float = 0.0  # Set by get_routing_decision() for history tracking
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +128,7 @@ class TurnRouter:
                 complexity_score=complexity,
                 interaction_mode=mode,
                 reason=reason,
-                swap_required=self._swap_required(target),
+                swap_required=False,  # Set by get_routing_decision() in Phase 2
             )
 
         # Interactive mode
@@ -159,7 +160,7 @@ class TurnRouter:
             complexity_score=complexity,
             interaction_mode=mode,
             reason=reason,
-            swap_required=self._swap_required(target),
+            swap_required=False,  # Set by get_routing_decision() in Phase 2
         )
 
     def _score_complexity(self, context: RoutingContext) -> float:
@@ -221,11 +222,4 @@ class TurnRouter:
         logger.debug("complexity: final=%.2f", result)
         return result
 
-    def _swap_required(self, target: str) -> bool:
-        """Phase 1 stub — always False.
 
-        Phase 2 swap_required logic lives in agent/routing/__init__.py:
-        get_routing_decision() updates the flag after comparing target vs.
-        the current SwapManager position.
-        """
-        return False

@@ -20,6 +20,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
+from collections import deque
 
 logger = logging.getLogger(__name__)
 
@@ -75,20 +76,9 @@ class OversightConfig:
 
 def load_oversight_config(cfg: Optional[Dict[str, Any]] = None) -> OversightConfig:
     """Load oversight config from model.routing.oversight section."""
-    if cfg is None:
-        try:
-            from hermes_cli.config import load_config
-            cfg = load_config() or {}
-        except Exception:
-            cfg = {}
+    from agent.routing.config import _load_section
 
-    try:
-        from hermes_cli.config import cfg_get
-        oversight_raw = cfg_get(cfg, "model", "routing", "oversight") or {}
-    except Exception:
-        routing = (cfg.get("model") or {}).get("routing") or {}
-        oversight_raw = routing.get("oversight") or {}
-
+    oversight_raw = _load_section(cfg, "model", "routing", "oversight")
     if not isinstance(oversight_raw, dict):
         return OversightConfig()
 
@@ -160,7 +150,7 @@ class OversightReviewer:
     def __init__(self, config: OversightConfig) -> None:
         self.config = config
         self.reviews: List[OversightResult] = []
-        self._turn_token_counts: List[int] = []  # rolling window for RD-18
+        self._turn_token_counts = deque(maxlen=20)  # rolling window for RD-18
         self._budget_warning_shown: bool = False  # Track if user was warned about exhausted budget
 
     @property
@@ -263,10 +253,7 @@ class OversightReviewer:
 
     def record_turn_tokens(self, token_count: int) -> None:
         """Record token count for a turn (used by dynamic window cap)."""
-        self._turn_token_counts.append(token_count)
-        # Keep rolling window of 20
-        if len(self._turn_token_counts) > 20:
-            self._turn_token_counts = self._turn_token_counts[-20:]
+        self._turn_token_counts.append(token_count)  # deque handles maxlen=20 automatically
 
     def review(
         self,
@@ -424,7 +411,8 @@ class OversightReviewer:
         except json.JSONDecodeError:
             # Try to extract JSON from the response
             import re
-            json_match = re.search(r'\{[^}]+\}', content, re.DOTALL)
+            # Greedy matching to handle nested braces in note/reason fields
+            json_match = re.search(r'\{.*\}', content, re.DOTALL)
             if json_match:
                 try:
                     data = json.loads(json_match.group())

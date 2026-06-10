@@ -8,11 +8,11 @@ from unittest.mock import MagicMock, patch
 from agent.routing.ask_upper import (
     ASK_UPPER_TOOL_SCHEMA,
     MENTOR_SYSTEM_PROMPT,
-    AskUpperBudget,
     AskUpperTool,
     get_or_create_ask_upper_tool,
     should_register_ask_upper,
 )
+from agent.routing.budget import BudgetTracker
 
 
 # ---------------------------------------------------------------------------
@@ -66,20 +66,20 @@ class TestAskUpperSchema:
 
 class TestAskUpperBudget:
     def test_initial_state(self):
-        budget = AskUpperBudget()
+        budget = BudgetTracker()
         assert budget.calls == 0
         assert not budget.exhausted
-        assert not budget.over_soft_budget
+        assert not budget.over_soft
 
     def test_soft_budget(self):
-        budget = AskUpperBudget(soft_budget_calls=3)
+        budget = BudgetTracker(soft_limit=3)
         budget.calls = 2
-        assert not budget.over_soft_budget
+        assert not budget.over_soft
         budget.calls = 3
-        assert budget.over_soft_budget
+        assert budget.over_soft
 
     def test_hard_budget(self):
-        budget = AskUpperBudget(hard_budget_calls=5)
+        budget = BudgetTracker(hard_limit=5)
         budget.calls = 4
         assert not budget.exhausted
         budget.calls = 5
@@ -205,8 +205,8 @@ class TestAskUpperTool:
     def test_get_status(self, tool):
         status = tool.get_status()
         assert status["calls"] == 0
-        assert status["soft_budget"] == 3
-        assert status["hard_budget"] == 5
+        assert status["soft_limit"] == 3
+        assert status["hard_limit"] == 5
         assert not status["exhausted"]
 
 

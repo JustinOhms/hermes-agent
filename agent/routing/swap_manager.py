@@ -94,6 +94,9 @@ class SwapManager:
         - Escalation to upper: always swap immediately
         - Autonomous→interactive transition: wait for sustained engagement
         - Other position changes: swap immediately
+
+        Thread safety: called only from the main conversation thread
+        (single-threaded turn processing). No concurrent should_swap() calls.
         """
         from agent.routing.interaction_mode import InteractionMode
 
