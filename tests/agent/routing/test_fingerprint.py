@@ -276,3 +276,173 @@ class TestSystemPromptRemoval:
             # the key assertion is that the code path we edited no longer
             # adds Model/Provider. We verified this via the diff.
             pass
+
+
+class TestFingerprintCollision:
+    """Test fingerprint collision handling."""
+
+    def test_two_different_models_same_fingerprint(self):
+        """Test that two different models with same fingerprint are handled correctly."""
+        from agent.routing.fingerprint import resolve_fingerprint
+
+        # Create two agents with same fingerprint (simulating aliasing)
+        agent1 = MagicMock()
+        agent1.model = "claude-opus-4-6"
+        agent1.provider = "bedrock"
+        agent1.base_url = "https://bedrock.us-east-1.amazonaws.com"
+        agent1._routing_swap_manager = None
+
+        agent2 = MagicMock()
+        agent2.model = "us.anthropic.claude-opus-4-6-v1"
+        agent2.provider = "bedrock"
+        agent2.base_url = "https://bedrock-runtime.us-east-1.amazonaws.com"
+        agent2._routing_swap_manager = None
+
+        # Both should resolve to the same fingerprint
+        fp1 = resolve_fingerprint(agent1)
+        fp2 = resolve_fingerprint(agent2)
+
+        # Fingerprint should be consistent for same model family
+        assert fp1.model_id == fp2.model_id or fp1.family == fp2.family
+
+    def test_fingerprint_uniqueness_for_different_models(self):
+        """Test that different model families have different fingerprints."""
+        from agent.routing.fingerprint import resolve_fingerprint
+
+        agent1 = MagicMock()
+        agent1.model = "claude-opus-4-6"
+        agent1.provider = "bedrock"
+        agent1.base_url = "https://bedrock.us-east-1.amazonaws.com"
+        agent1._routing_swap_manager = None
+
+        agent2 = MagicMock()
+        agent2.model = "gpt-4o"
+        agent2.provider = "openai"
+        agent2.base_url = "https://api.openai.com/v1"
+        agent2._routing_swap_manager = None
+
+        fp1 = resolve_fingerprint(agent1)
+        fp2 = resolve_fingerprint(agent2)
+
+        # Different families should have different fingerprints
+        assert fp1.family != fp2.family
+        assert fp1.provider != fp2.provider
+
+
+class TestRoutingGraphContext:
+    """Test routing graph context injection into fingerprint."""
+
+    def test_routing_graph_populated_when_routing_enabled(self):
+        """When routing is active, fingerprint includes graph context."""
+        from agent.routing.fingerprint import _build_routing_graph_context
+        from agent.routing.config import RoutingConfig, GraphPosition
+
+        config = RoutingConfig(
+            enabled=True,
+            graph={
+                "interactive_lower": GraphPosition(
+                    provider="custom:llm-local", model="qwen3-coder-next",
+                    base_url="http://127.0.0.1:58080/v1", llm_config_name="coder-next",
+                    display_name="Qwen3 Coder Next",
+                ),
+                "upper": GraphPosition(
+                    provider="bedrock", model="us.anthropic.claude-opus-4-6-v1",
+                    display_name="Claude Opus 4",
+                ),
+            }
+        )
+
+        with patch("agent.routing.config.load_routing_config", return_value=config):
+            ctx = _build_routing_graph_context("interactive_lower")
+
+        assert ctx is not None
+        assert ctx.active_position == "interactive_lower"
+        assert "interactive_lower" in ctx.positions
+        assert "upper" in ctx.positions
+        assert "Claude Opus 4" in ctx.configured_upper
+        assert "[local]" in ctx.positions["interactive_lower"]
+        assert "[local]" not in ctx.positions["upper"]
+
+    def test_routing_graph_none_when_disabled(self):
+        """When routing is disabled, graph context is None."""
+        from agent.routing.fingerprint import _build_routing_graph_context
+        from agent.routing.config import RoutingConfig
+
+        config = RoutingConfig(enabled=False, graph={})
+
+        with patch("agent.routing.config.load_routing_config", return_value=config):
+            ctx = _build_routing_graph_context("upper")
+
+        assert ctx is None
+
+    def test_to_prompt_line_includes_graph(self):
+        """to_prompt_line() renders the routing graph section."""
+        from agent.routing.types import ModelFingerprint, RoutingGraphContext
+
+        ctx = RoutingGraphContext(
+            active_position="interactive_lower",
+            positions={
+                "interactive_lower": "Qwen3 Coder Next (custom:llm-local) [local]",
+                "upper": "Claude Opus 4 (bedrock)",
+            },
+            configured_upper="Claude Opus 4 (bedrock)",
+        )
+        fp = ModelFingerprint(
+            model_id="qwen3-coder-next",
+            provider="custom:llm-local",
+            display_name="Qwen3 Coder Next",
+            base_url="http://127.0.0.1:58080/v1",
+            position="interactive_lower",
+            is_local=True,
+            family="qwen",
+            routing_graph=ctx,
+        )
+
+        output = fp.to_prompt_line()
+        assert "Routing graph (model routing is active):" in output
+        assert "← you are here" in output
+        assert "Claude Opus 4 (bedrock)" in output
+        # The active position should have the marker
+        assert "interactive_lower: Qwen3 Coder Next (custom:llm-local) [local] ← you are here" in output
+
+    def test_to_dict_includes_routing_graph(self):
+        """to_dict() includes routing_graph when populated."""
+        from agent.routing.types import ModelFingerprint, RoutingGraphContext
+
+        ctx = RoutingGraphContext(
+            active_position="upper",
+            positions={"upper": "Claude Opus 4 (bedrock)"},
+            configured_upper="Claude Opus 4 (bedrock)",
+        )
+        fp = ModelFingerprint(
+            model_id="us.anthropic.claude-opus-4-6-v1",
+            provider="bedrock",
+            display_name="Claude Opus 4",
+            base_url="https://bedrock-runtime.us-east-1.amazonaws.com",
+            position="upper",
+            is_local=False,
+            family="claude",
+            routing_graph=ctx,
+        )
+
+        d = fp.to_dict()
+        assert "routing_graph" in d
+        assert d["routing_graph"]["active_position"] == "upper"
+        assert "upper" in d["routing_graph"]["positions"]
+
+    def test_to_dict_omits_routing_graph_when_none(self):
+        """to_dict() omits routing_graph when not populated."""
+        from agent.routing.types import ModelFingerprint
+
+        fp = ModelFingerprint(
+            model_id="gpt-4o",
+            provider="openai",
+            display_name="GPT-4o",
+            base_url="https://api.openai.com/v1",
+            position="",
+            is_local=False,
+            family="gpt",
+        )
+
+        d = fp.to_dict()
+        assert "routing_graph" not in d

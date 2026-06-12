@@ -1,8 +1,14 @@
-"""Model fingerprint registry — resolves the active model identity at API-call time.
+"""Model fingerprint resolver — minimal builtin-only implementation.
 
-The fingerprint is the authoritative source of "what model is actually processing
-this request" — derived from the concrete API endpoint + model parameter that will
-be sent over the wire, NOT from cached session state.
+This module resolves the active model identity at API-call time using a
+static builtin catalog.  It is self-contained (no network calls) and ships
+with the routing PR.
+
+The catalog module (separate PR) replaces the internal matching logic with
+live sources (OpenRouter, models.dev, AI Model Directory) while preserving
+the same public API:
+  - resolve_fingerprint(agent) → ModelFingerprint
+  - get_fingerprint_table(agent) → List[Dict]
 
 Consumers:
   - Ephemeral system prompt injection (tells the model who it is)
@@ -14,104 +20,201 @@ Consumers:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from agent.routing.config import is_local_position
+from agent.routing.types import (
+    FingerprintEntry,
+    ModelCapabilities,
+    ModelFingerprint,
+    RoutingGraphContext,
+)
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class ModelFingerprint:
-    """Resolved identity of the model processing the current request."""
-    model_id: str           # Exact model string sent to the API (e.g. "us.anthropic.claude-opus-4-6-v1")
-    provider: str           # Provider name (e.g. "bedrock", "custom:llm-local")
-    display_name: str       # Human-friendly name (e.g. "Claude Opus 4", "Qwen3 Coder Next")
-    base_url: str           # API endpoint being called (masked for display)
-    position: str           # Routing graph position if routing is active (e.g. "upper", "interactive_lower")
-    is_local: bool          # Whether this is a local model on :58080
-    family: str             # Model family for capability hints (e.g. "claude", "qwen", "gpt")
+# ─── Builtin catalog of well-known models ─────────────────────────────────────
+# Keyed by canonical_id (provider/model).  Extended at runtime by the catalog
+# module when available.
 
-    def to_prompt_line(self) -> str:
-        """Format for injection into the ephemeral system prompt."""
-        parts = [f"Model: {self.model_id}"]
-        if self.provider:
-            parts.append(f"Provider: {self.provider}")
-        if self.display_name and self.display_name != self.model_id:
-            parts.append(f"Display name: {self.display_name}")
-        if self.position:
-            parts.append(f"Routing position: {self.position}")
-        return "\n".join(parts)
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Serialize for JSON-RPC / TUI events."""
-        return {
-            "model_id": self.model_id,
-            "provider": self.provider,
-            "display_name": self.display_name,
-            "base_url": _mask_url(self.base_url),
-            "position": self.position,
-            "is_local": self.is_local,
-            "family": self.family,
-        }
-
-
-# ── Registry: maps (provider, model) → display metadata ─────────────────────
-
-@dataclass
-class FingerprintEntry:
-    """Static metadata for a known model, used to populate display_name and family."""
-    display_name: str
-    family: str
-
-
-# Built-in catalog of well-known models.  Extended at runtime by the
-# routing graph's display_name fields and custom_providers config.
-_BUILTIN_CATALOG: Dict[str, FingerprintEntry] = {
+_BUILTIN_CATALOG: List[FingerprintEntry] = [
     # Anthropic / Bedrock
-    "claude-opus-4-6": FingerprintEntry("Claude Opus 4", "claude"),
-    "claude-sonnet-4-6": FingerprintEntry("Claude Sonnet 4", "claude"),
-    "claude-sonnet-4-5": FingerprintEntry("Claude Sonnet 4.5", "claude"),
-    "claude-haiku-3-5": FingerprintEntry("Claude Haiku 3.5", "claude"),
+    FingerprintEntry(
+        display_name="Claude Opus 4",
+        family="claude",
+        canonical_id="anthropic/claude-opus-4-6",
+        urls=["https://api.anthropic.com/v1", "https://bedrock-runtime.us-east-1.amazonaws.com"],
+    ),
+    FingerprintEntry(
+        display_name="Claude Sonnet 4",
+        family="claude",
+        canonical_id="anthropic/claude-sonnet-4-6",
+        urls=["https://api.anthropic.com/v1", "https://bedrock-runtime.us-east-1.amazonaws.com"],
+    ),
+    FingerprintEntry(
+        display_name="Claude Sonnet 4.5",
+        family="claude",
+        canonical_id="anthropic/claude-sonnet-4-5",
+        urls=["https://api.anthropic.com/v1", "https://bedrock-runtime.us-east-1.amazonaws.com"],
+    ),
+    FingerprintEntry(
+        display_name="Claude Haiku 3.5",
+        family="claude",
+        canonical_id="anthropic/claude-3-5-haiku",
+        urls=["https://api.anthropic.com/v1", "https://bedrock-runtime.us-east-1.amazonaws.com"],
+    ),
     # OpenAI
-    "gpt-4o": FingerprintEntry("GPT-4o", "gpt"),
-    "gpt-4.1": FingerprintEntry("GPT-4.1", "gpt"),
-    "o3": FingerprintEntry("o3", "gpt"),
-    "o4-mini": FingerprintEntry("o4-mini", "gpt"),
-    "codex-mini": FingerprintEntry("Codex Mini", "gpt"),
-    # Qwen
-    "qwen3-coder-next": FingerprintEntry("Qwen3 Coder Next", "qwen"),
-    "qwen3-coder-30b": FingerprintEntry("Qwen3 Coder 30B", "qwen"),
-    "qwen3.6-27b": FingerprintEntry("Qwen3.6 27B", "qwen"),
-    "qwen3.6-35b-a3b": FingerprintEntry("Qwen3.6 35B-A3B MoE", "qwen"),
+    FingerprintEntry(
+        display_name="GPT-4o",
+        family="gpt",
+        canonical_id="openai/gpt-4o",
+        urls=["https://api.openai.com/v1"],
+    ),
+    FingerprintEntry(
+        display_name="GPT-4.1",
+        family="gpt",
+        canonical_id="openai/gpt-4.1",
+        urls=["https://api.openai.com/v1"],
+    ),
+    FingerprintEntry(
+        display_name="o3",
+        family="gpt",
+        canonical_id="openai/o3",
+        urls=["https://api.openai.com/v1"],
+    ),
+    FingerprintEntry(
+        display_name="o4-mini",
+        family="gpt",
+        canonical_id="openai/o4-mini",
+        urls=["https://api.openai.com/v1"],
+    ),
+    FingerprintEntry(
+        display_name="GPT-5",
+        family="gpt",
+        canonical_id="openai/gpt-5",
+        urls=["https://api.openai.com/v1"],
+    ),
+    # Qwen (Alibaba)
+    FingerprintEntry(
+        display_name="Qwen3 Coder Next",
+        family="qwen",
+        canonical_id="alibaba/qwen3-coder-next",
+        urls=["https://api.qwen.cn/v1", "https://dashscope.aliyuncs.com/compatible-mode/v1"],
+    ),
+    FingerprintEntry(
+        display_name="Qwen3 Coder 30B",
+        family="qwen",
+        canonical_id="alibaba/qwen3-coder-30b-a3b-instruct",
+        urls=["https://api.qwen.cn/v1", "https://dashscope.aliyuncs.com/compatible-mode/v1"],
+    ),
+    FingerprintEntry(
+        display_name="Qwen3.6 27B",
+        family="qwen",
+        canonical_id="alibaba/qwen3.6-27b",
+        urls=["https://api.qwen.cn/v1", "https://dashscope.aliyuncs.com/compatible-mode/v1"],
+    ),
+    FingerprintEntry(
+        display_name="Qwen3.6 35B-A3B MoE",
+        family="qwen",
+        canonical_id="alibaba/qwen3.6-35b-a3b",
+        urls=["https://api.qwen.cn/v1", "https://dashscope.aliyuncs.com/compatible-mode/v1"],
+    ),
     # Google
-    "gemini-2.5-pro": FingerprintEntry("Gemini 2.5 Pro", "gemini"),
-    "gemini-2.5-flash": FingerprintEntry("Gemini 2.5 Flash", "gemini"),
+    FingerprintEntry(
+        display_name="Gemini 2.5 Pro",
+        family="gemini",
+        canonical_id="google/gemini-2.5-pro",
+        urls=["https://generativelanguage.googleapis.com/v1"],
+    ),
+    FingerprintEntry(
+        display_name="Gemini 2.5 Flash",
+        family="gemini",
+        canonical_id="google/gemini-2.5-flash",
+        urls=["https://generativelanguage.googleapis.com/v1"],
+    ),
     # xAI
-    "grok-3": FingerprintEntry("Grok 3", "grok"),
-    "grok-3-mini": FingerprintEntry("Grok 3 Mini", "grok"),
-}
+    FingerprintEntry(
+        display_name="Grok 3",
+        family="grok",
+        canonical_id="xai/grok-3",
+        urls=["https://api.x.ai/v1"],
+    ),
+    FingerprintEntry(
+        display_name="Grok 3 Mini",
+        family="grok",
+        canonical_id="xai/grok-3-mini",
+        urls=["https://api.x.ai/v1"],
+    ),
+    # DeepSeek
+    FingerprintEntry(
+        display_name="DeepSeek R1",
+        family="deepseek",
+        canonical_id="deepseek/deepseek-r1",
+        urls=["https://api.deepseek.com/v1"],
+    ),
+    FingerprintEntry(
+        display_name="DeepSeek Chat",
+        family="deepseek",
+        canonical_id="deepseek/deepseek-chat",
+        urls=["https://api.deepseek.com/v1"],
+    ),
+]
 
 
-def _match_catalog(model_id: str) -> Optional[FingerprintEntry]:
-    """Fuzzy-match a model_id against the builtin catalog.
+# ─── Matching logic ───────────────────────────────────────────────────────────
 
-    Tries exact match first, then substring containment (longest match wins).
+
+def _match_catalog(model_id: str, base_url: str = "") -> Optional[FingerprintEntry]:
+    """Match a model_id against the builtin catalog.
+
+    Matching strategy (in priority order):
+    1. Exact canonical_id match (e.g. "anthropic/claude-opus-4-6")
+    2. URL + model_id substring match (both must match for confidence)
+    3. Longest substring match on canonical_id parts
+    4. Provider/model suffix match for slash-separated IDs
+
+    The catalog module overrides this with live-source lookups.
     """
     model_lower = model_id.lower()
+    base_url_lower = base_url.lower()
 
-    # Exact match
-    if model_lower in _BUILTIN_CATALOG:
-        return _BUILTIN_CATALOG[model_lower]
+    # 1. Exact canonical_id match
+    for entry in _BUILTIN_CATALOG:
+        if entry.canonical_id and entry.canonical_id.lower() == model_lower:
+            return entry
 
-    # Substring match — longest catalog key that appears in the model_id wins
+    # 2. URL + model substring match (high confidence)
+    if base_url_lower:
+        for entry in _BUILTIN_CATALOG:
+            if not entry.urls:
+                continue
+            url_match = any(u.lower() in base_url_lower or base_url_lower in u.lower() for u in entry.urls)
+            if url_match and entry.canonical_id:
+                # Check if model_id contains the model part of canonical_id
+                _, model_part = entry.canonical_id.lower().rsplit("/", 1)
+                if model_part in model_lower:
+                    return entry
+
+    # 3. Longest substring match on canonical_id parts
     best: Optional[FingerprintEntry] = None
     best_len = 0
-    for key, entry in _BUILTIN_CATALOG.items():
-        if key in model_lower and len(key) > best_len:
-            best = entry
-            best_len = len(key)
+
+    for entry in _BUILTIN_CATALOG:
+        if entry.canonical_id:
+            for part in entry.canonical_id.lower().split("/"):
+                if part in model_lower and len(part) > best_len:
+                    best = entry
+                    best_len = len(part)
+
+    # 4. Provider/model suffix match
+    if "/" in model_lower:
+        provider, model = model_lower.split("/", 1)
+        for entry in _BUILTIN_CATALOG:
+            if entry.canonical_id:
+                ep, em = entry.canonical_id.lower().split("/", 1)
+                if em == model and provider in (ep, ep.replace("-", "")):
+                    return entry
+
     return best
 
 
@@ -178,7 +281,52 @@ def _resolve_display_name_from_graph(model_id: str, provider: str, position: str
     return ""
 
 
-# ── Main entry point ─────────────────────────────────────────────────────────
+# ─── Public API ───────────────────────────────────────────────────────────────
+
+
+def _build_routing_graph_context(current_position: str) -> Optional[RoutingGraphContext]:
+    """Build a RoutingGraphContext from the active routing config.
+
+    Returns None if routing is disabled or the graph is empty.
+    Provides just enough info for the model to understand the routing topology
+    without bloating the system prompt.
+    """
+    try:
+        from agent.routing.config import load_routing_config
+        config = load_routing_config()
+        if not config or not config.enabled or not config.graph:
+            return None
+    except Exception:
+        return None
+
+    positions: Dict[str, str] = {}
+    configured_upper = ""
+
+    for pos_name, pos_cfg in config.graph.items():
+        # Build a compact description for each position
+        pos_display = getattr(pos_cfg, "display_name", "") or ""
+        if not pos_display:
+            # Try catalog lookup for a friendly name
+            entry = _match_catalog(pos_cfg.model, pos_cfg.base_url)
+            pos_display = entry.display_name if entry else pos_cfg.model
+
+        pos_desc = f"{pos_display} ({pos_cfg.provider})"
+        if is_local_position(pos_cfg.base_url, pos_cfg.llm_config_name):
+            pos_desc += " [local]"
+
+        positions[pos_name] = pos_desc
+
+        if pos_name == "upper":
+            configured_upper = pos_desc
+
+    if not positions:
+        return None
+
+    return RoutingGraphContext(
+        active_position=current_position,
+        positions=positions,
+        configured_upper=configured_upper,
+    )
 
 
 def resolve_fingerprint(agent: object) -> ModelFingerprint:
@@ -186,6 +334,9 @@ def resolve_fingerprint(agent: object) -> ModelFingerprint:
 
     Called just before each API call.  Reads agent.model, agent.provider,
     agent.base_url — the actual values that will be used for the request.
+
+    The catalog module monkey-patches this function to add live-source
+    resolution and capability enrichment.
     """
     model_id = getattr(agent, "model", "") or ""
     provider = getattr(agent, "provider", "") or ""
@@ -199,7 +350,7 @@ def resolve_fingerprint(agent: object) -> ModelFingerprint:
     family = ""
 
     if not display_name:
-        entry = _match_catalog(model_id)
+        entry = _match_catalog(model_id, base_url)
         if entry:
             display_name = entry.display_name
             family = entry.family
@@ -210,14 +361,19 @@ def resolve_fingerprint(agent: object) -> ModelFingerprint:
     else:
         family = _infer_family(model_id, provider)
 
+    # ── Build routing graph context for model self-awareness ──
+    routing_graph = _build_routing_graph_context(position)
+
     return ModelFingerprint(
         model_id=model_id,
         provider=provider,
         display_name=display_name,
-        base_url=base_url,
+        base_url=_mask_url(base_url),
         position=position,
         is_local=is_local,
         family=family,
+        capabilities=ModelCapabilities(),  # Enriched by catalog module when available
+        routing_graph=routing_graph,
     )
 
 
@@ -251,7 +407,7 @@ def get_fingerprint_table(agent: object) -> List[Dict[str, Any]]:
                 # Resolve display name
                 graph_display = getattr(pos_cfg, "display_name", "") if hasattr(pos_cfg, "display_name") else ""
                 if not graph_display:
-                    entry = _match_catalog(pos_model)
+                    entry = _match_catalog(pos_model, pos_base_url)
                     graph_display = entry.display_name if entry else pos_model
                 pos_family = _infer_family(pos_model, pos_provider)
 
@@ -264,6 +420,7 @@ def get_fingerprint_table(agent: object) -> List[Dict[str, Any]]:
                     "position": pos_name,
                     "is_local": pos_is_local,
                     "family": pos_family,
+                    "capabilities": ModelCapabilities().to_dict(),
                     "active": is_active,
                     "source": "graph",
                 })
