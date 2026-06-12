@@ -72,6 +72,7 @@ class OversightConfig:
     min_turns_before_first: int = 5
     skip_if_escalated: bool = True
     upper_context_limit: int = 200000  # tokens — Opus 4 default
+    prompt_file: str = ""  # Path to custom prompt file (YAML with 'prompt' key)
 
 
 def load_oversight_config(cfg: Optional[Dict[str, Any]] = None) -> OversightConfig:
@@ -98,6 +99,7 @@ def load_oversight_config(cfg: Optional[Dict[str, Any]] = None) -> OversightConf
         min_turns_before_first=_safe_int(oversight_raw.get("min_turns_before_first"), 5, min_val=1),
         skip_if_escalated=bool(oversight_raw.get("skip_if_escalated", True)),
         upper_context_limit=_safe_int(oversight_raw.get("upper_context_limit"), 200000, min_val=10000),
+        prompt_file=str(oversight_raw.get("prompt_file", "")),
     )
 
 
@@ -273,14 +275,18 @@ class OversightReviewer:
         """
         window_size = len([m for m in messages if m.get("role") in ("user", "assistant")])
 
-        # Build the oversight prompt
-        prompt = OVERSIGHT_PROMPT.format(
-            window=window_size,
-            primary_model=primary_model,
-            oversight_model=self.config.model,
-            turn_count=turn_count,
-            review_number=self.review_count + 1,
-        )
+        # Build the oversight prompt (from file if specified, else builtin with examples)
+        if self.config.prompt_file:
+            prompt = self._load_custom_prompt(window_size, primary_model, turn_count)
+        else:
+            # Use builtin prompt with examples for each action type
+            prompt = OVERSIGHT_PROMPT.format(
+                window=window_size,
+                primary_model=primary_model,
+                oversight_model=self.config.model,
+                turn_count=turn_count,
+                review_number=self.review_count + 1,
+            )
 
         # Format the messages for review
         review_content = self._format_messages_for_review(messages)
@@ -346,6 +352,61 @@ class OversightReviewer:
             )
             self.reviews.append(result)
             return result
+
+    def _load_custom_prompt(self, window_size: int, primary_model: str, turn_count: int) -> str:
+        """Load custom prompt from YAML file if specified."""
+        import yaml
+        from pathlib import Path
+        
+        prompt_path = Path(self.config.prompt_file)
+        if not prompt_path.exists():
+            logger.warning(
+                "oversight: prompt_file '%s' not found, using builtin prompt",
+                self.config.prompt_file,
+            )
+            return OVERSIGHT_PROMPT.format(
+                window=window_size,
+                primary_model=primary_model,
+                oversight_model=self.config.model,
+                turn_count=turn_count,
+                review_number=self.review_count + 1,
+            )
+        
+        try:
+            data = yaml.safe_load(prompt_path.read_text())
+            if not isinstance(data, dict) or "prompt" not in data:
+                logger.warning(
+                    "oversight: prompt file must have 'prompt' key, using builtin"
+                )
+                return OVERSIGHT_PROMPT.format(
+                    window=window_size,
+                    primary_model=primary_model,
+                    oversight_model=self.config.model,
+                    turn_count=turn_count,
+                    review_number=self.review_count + 1,
+                )
+            
+            base_prompt = data["prompt"]
+            # Fill in the dynamic placeholders
+            return base_prompt.format(
+                window=window_size,
+                primary_model=primary_model,
+                oversight_model=self.config.model,
+                turn_count=turn_count,
+                review_number=self.review_count + 1,
+            )
+        except Exception as exc:
+            logger.warning(
+                "oversight: failed to load prompt from '%s': %s, using builtin",
+                self.config.prompt_file, exc,
+            )
+            return OVERSIGHT_PROMPT.format(
+                window=window_size,
+                primary_model=primary_model,
+                oversight_model=self.config.model,
+                turn_count=turn_count,
+                review_number=self.review_count + 1,
+            )
 
     def _format_messages_for_review(self, messages: List[Dict[str, Any]]) -> str:
         """Format conversation messages into a readable review payload."""
