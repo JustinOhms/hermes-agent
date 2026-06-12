@@ -177,3 +177,98 @@ class TestInitSwapManagerPosition:
 
         # Should fall back to first position in graph
         assert mgr._current_position == "interactive_lower"
+
+
+class TestOversightEscalationOverride:
+    """Test RD-21: oversight escalation forces upper model."""
+
+    def _make_config(self) -> RoutingConfig:
+        config = RoutingConfig(enabled=True)
+        config.graph = {
+            "interactive_lower": GraphPosition(
+                provider="custom:llm-local",
+                model="qwen3-coder-next",
+                base_url="http://127.0.0.1:58080/v1",
+                llm_config_name="coder-next",
+            ),
+            "upper": GraphPosition(
+                provider="bedrock",
+                model="us.anthropic.claude-opus-4-6-v1",
+            ),
+        }
+        return config
+
+    def test_escalation_pending_forces_upper(self):
+        """When _oversight_escalation_pending is True, route to upper."""
+        from agent.routing import get_routing_decision
+
+        agent = MagicMock()
+        agent._oversight_escalation_pending = True
+        agent._routing_decision_history = None
+
+        with patch("agent.routing._load_cached_config", return_value=self._make_config()):
+            decision = get_routing_decision(agent, "hello")
+
+        assert decision is not None
+        assert decision.target_position == "upper"
+        assert decision.reason == "oversight_escalation"
+        assert decision.swap_required is True
+        assert decision.complexity_score == 1.0
+        # Flag should be cleared
+        assert agent._oversight_escalation_pending is False
+
+    def test_escalation_clears_flag(self):
+        """Escalation flag is cleared after one use (single-turn override)."""
+        from agent.routing import get_routing_decision
+
+        agent = MagicMock()
+        agent._oversight_escalation_pending = True
+        agent._routing_decision_history = None
+
+        config = self._make_config()
+
+        with patch("agent.routing._load_cached_config", return_value=config):
+            # First call: escalation fires
+            d1 = get_routing_decision(agent, "hello")
+            assert d1.target_position == "upper"
+
+            # Second call: normal routing (no escalation)
+            agent._routing_mode_detector = None
+            agent._routing_swap_manager = None
+            d2 = get_routing_decision(agent, "hello again")
+            # Should not be forced to upper (depends on heuristics, but reason != oversight_escalation)
+            if d2:
+                assert d2.reason != "oversight_escalation"
+
+    def test_no_escalation_when_flag_false(self):
+        """Normal routing when flag is not set."""
+        from agent.routing import get_routing_decision
+
+        agent = MagicMock()
+        agent._oversight_escalation_pending = False
+        agent._routing_mode_detector = None
+        agent._routing_swap_manager = None
+        agent._routing_decision_history = None
+
+        with patch("agent.routing._load_cached_config", return_value=self._make_config()):
+            decision = get_routing_decision(agent, "hello")
+
+        if decision:
+            assert decision.reason != "oversight_escalation"
+
+    def test_escalation_appends_to_history(self):
+        """Escalation decision is tracked in decision history."""
+        from collections import deque
+        from agent.routing import get_routing_decision
+
+        agent = MagicMock()
+        agent._oversight_escalation_pending = True
+        history = deque(maxlen=20)
+        agent._routing_decision_history = history
+
+        with patch("agent.routing._load_cached_config", return_value=self._make_config()):
+            get_routing_decision(agent, "hello")
+
+        assert len(history) == 1
+        assert history[0].reason == "oversight_escalation"
+        assert history[0]._timestamp > 0

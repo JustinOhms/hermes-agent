@@ -1,6 +1,6 @@
 # ADR-0040: Intelligent Model Routing & Periodic Oversight
 
-**Status:** Draft  
+**Status:** Accepted  
 **Date:** 2026-06-06  
 **Author:** Justin Ohms + Hermes  
 **Deciders:** Justin Ohms  
@@ -1537,12 +1537,12 @@ model:
       upper_context_limit: 200000
 ```
 
-### RD-21: ESCALATE action handling (pending)
+### RD-21: ESCALATE action handling (implemented)
 
-**Deferred:** When the oversight model returns `ESCALATE`, the flag `_oversight_escalation_pending` is set on the agent. The next `run_conversation()` call should:
-1. Check this flag before routing decisions
-2. Force the upper model for the next turn (bypass turn_router)
-3. Clear the flag after the upper model responds
-4. If the upper model resolves the issue, allow normal routing to resume
+**Implemented 2026-06-12:** When the oversight model returns `ESCALATE`, the flag `_oversight_escalation_pending` is set on the agent. On the next `get_routing_decision()` call:
+1. The flag is checked before any heuristic routing
+2. The upper model is forced for that turn (bypass turn_router, `swap_required=True`)
+3. The flag is cleared (single-turn override — re-evaluation resumes after)
+4. The decision is tracked in the routing history ring buffer with `reason="oversight_escalation"`
 
-This is intentionally not wired yet — it requires the swap machinery (Phase 2) to be tested end-to-end first. The flag is set and logged but not consumed by any turn-start logic yet.
+If the graph has no "upper" position, a warning is logged and normal routing proceeds.

@@ -37,6 +37,41 @@ def get_routing_decision(agent: object, user_message: str) -> Optional[RoutingDe
         if not config.enabled:
             return None
 
+        # ── RD-21: Oversight escalation override ──
+        # When the oversight model has requested escalation, force the upper model
+        # for this turn and clear the flag. This bypasses normal heuristic routing.
+        if getattr(agent, "_oversight_escalation_pending", False):
+            try:
+                agent._oversight_escalation_pending = False
+            except Exception:
+                pass
+            if "upper" in config.graph:
+                logger.info(
+                    "routing: oversight escalation override — forcing upper model"
+                )
+                decision = RoutingDecision(
+                    target_position="upper",
+                    complexity_score=1.0,
+                    interaction_mode=InteractionMode.INTERACTIVE,
+                    reason="oversight_escalation",
+                    swap_required=True,
+                )
+                # Append to decision history
+                try:
+                    history = getattr(agent, "_routing_decision_history", None)
+                    if history is None:
+                        history = deque(maxlen=20)
+                        setattr(agent, "_routing_decision_history", history)
+                    decision._timestamp = time.time()
+                    history.append(decision)
+                except Exception:
+                    pass
+                return decision
+            else:
+                logger.warning(
+                    "routing: oversight escalation requested but no 'upper' position in graph"
+                )
+
         # Build or retrieve the per-agent mode detector
         detector = _get_or_create_detector(agent, config)
         detector.record_user_message()
