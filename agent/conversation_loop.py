@@ -5011,6 +5011,18 @@ def run_conversation(
                         )
                         messages.append(_injection)
                         logger.info("oversight: injected correction for next turn")
+                        # Emit TUI status update for CORRECT result
+                        try:
+                            _emit_routing_status = getattr(agent, "_emit_routing_status", None)
+                            if callable(_emit_routing_status):
+                                sid = getattr(agent, "session_id", "")
+                                note = _oversight_result.note[:80] if _oversight_result.note else "Corrective guidance"
+                                _emit_routing_status(
+                                    sid,
+                                    f"oversight: CORRECT — {note}",
+                                )
+                        except Exception:
+                            pass
                 elif _oversight_result.action == OversightAction.ESCALATE:
                     # Signal next turn to use upper model
                     agent._oversight_escalation_pending = True
@@ -5018,6 +5030,18 @@ def run_conversation(
                         "oversight: ESCALATION requested — reason: %s",
                         _oversight_result.reason,
                     )
+                    # Emit TUI status update for ESCALATE result
+                    try:
+                        _emit_routing_status = getattr(agent, "_emit_routing_status", None)
+                        if callable(_emit_routing_status):
+                            sid = getattr(agent, "session_id", "")
+                            reason = _oversight_result.reason[:80] if _oversight_result.reason else "Model stuck or making serious errors"
+                            _emit_routing_status(
+                                sid,
+                                f"oversight: ESCALATE — {reason}",
+                            )
+                    except Exception:
+                        pass
                 elif _oversight_result.action == OversightAction.FLAG:
                     # Notify user asynchronously
                     logger.warning(
