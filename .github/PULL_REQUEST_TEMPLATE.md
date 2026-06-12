@@ -10,6 +10,17 @@
 
 Fixes #
 
+## Related PRs
+
+<!-- If this PR depends on another PR, link it here. For routing/catalog split: -->
+
+- Depends on: #XXX (Routing PR) — for `agent/routing/types.py` contract
+- See also: #XXX (Catalog PR) — adds live model catalog resolution
+
+> **Note**: This repository uses a two-PR split for the routing feature:
+> - **Routing PR** defines the contract (dataclasses, minimal resolver, no network deps)
+> - **Catalog PR** adds live sources (OpenRouter, models.dev, AI Model Directory) via monkey-patching
+
 ## Type of Change
 
 <!-- Check the one that applies. -->

@@ -369,6 +369,8 @@ class AIAgent:
         provider_data_collection: str = None,
         openrouter_min_coding_score: Optional[float] = None,
         session_id: str = None,
+        routing_log: list = None,
+        oversight_log: list = None,
         tool_progress_callback: callable = None,
         tool_start_callback: callable = None,
         tool_complete_callback: callable = None,
@@ -4876,6 +4878,8 @@ class AIAgent:
         *,
         logger=None,
         session_id: str = None,
+        routing_log: list = None,
+        oversight_log: list = None,
     ) -> int:
         """Forwarder — see ``agent.agent_runtime_helpers.sanitize_tool_call_arguments``."""
         from agent.agent_runtime_helpers import sanitize_tool_call_arguments

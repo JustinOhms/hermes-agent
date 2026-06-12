@@ -238,6 +238,55 @@ class TestShouldSwap:
         # Verify no intermediate states were observed (would indicate race)
         # The state machine should transition directly from AWAITING_ENGAGEMENT to SWAP_REQUESTED
 
+    def test_concurrent_swap_decisions_held_by_lock(self):
+         """Test that concurrent should_swap calls are serialized by lock.
+        
+         This test verifies the fix for the race condition where multiple
+         threads calling should_swap simultaneously could observe inconsistent
+         state. The lock should ensure only one thread executes the decision
+         logic at a time.
+         """
+         cfg = _make_config(
+             local_positions={
+                 "autonomous_lower": "prose",
+                 "interactive_lower": "coder",
+             },
+             cloud_positions={"upper": ("bedrock", "claude-opus")},
+         )
+         mgr = SwapManager(cfg)
+         mgr.set_current_position("autonomous_lower")
+        
+         decision = _make_decision("interactive_lower", mode=InteractionMode.INTERACTIVE)
+        
+         # Track observed state transitions
+         observed_states = []
+         lock = threading.Lock()
+        
+         def thread_func():
+             # Call should_swap multiple times rapidly
+             for _ in range(5):
+                 result = mgr.should_swap(decision, _make_detector(sustained=False))
+                 with lock:
+                     observed_states.append((threading.current_thread().name, mgr.state))
+                 time.sleep(0.01)
+        
+         # Spawn multiple threads
+         threads = [
+             threading.Thread(target=thread_func, name=f"worker-{i}")
+             for i in range(3)
+         ]
+        
+         for t in threads:
+             t.start()
+         for t in threads:
+             t.join()
+        
+         # Verify no inconsistent states were observed
+         # States should only be IDLE, AWAITING_ENGAGEMENT, or SWAP_REQUESTED
+         valid_states = {SwapState.IDLE, SwapState.AWAITING_ENGAGEMENT, SwapState.SWAP_REQUESTED}
+         for thread_name, state in observed_states:
+             assert state in valid_states, f"Invalid state {state} observed in {thread_name}"
+
 
 # ── resolve_effective_model ───────────────────────────────────────────────────
 

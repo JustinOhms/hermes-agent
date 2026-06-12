@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pytest
-
 from agent.routing.config import (
     ComplexityConfig,
     DeEscalationConfig,
@@ -164,3 +163,31 @@ class TestGraphParsing:
         pos = cfg.graph["interactive_lower"]
         assert pos.profile.startup_latency_s == 0.0
         assert pos.profile.ttft_p50_ms == 0.0
+
+
+class TestConfigHotReload:
+    def test_ttl_cache_expires(self):
+        """Test that cache TTL logic correctly invalidates cache after 30s."""
+        import time
+        from agent.routing.config import _CONFIG_TTL, _CONFIG_CACHE, load_routing_config
+        from unittest.mock import patch, MagicMock
+
+        # Save original cache state
+        original_cache = _CONFIG_CACHE.copy()
+
+        try:
+            # Set cache timestamp to 31 seconds ago
+            _CONFIG_CACHE["timestamp"] = time.time() - _CONFIG_TTL - 1
+            _CONFIG_CACHE["config"] = load_routing_config({"model": {"routing": {"enabled": True}}})
+            old_config = _CONFIG_CACHE["config"]
+
+            # First call should re-load since TTL expired
+            new_config = load_routing_config({"model": {"routing": {"enabled": False}}})
+
+            # Config should be different (reloaded)
+            assert new_config.enabled is False
+            assert old_config.enabled is True
+        finally:
+            # Restore original cache
+            _CONFIG_CACHE.clear()
+            _CONFIG_CACHE.update(original_cache)

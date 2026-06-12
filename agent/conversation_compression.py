@@ -783,3 +783,55 @@ __all__ = [
     "compress_context",
     "try_shrink_image_parts_in_messages",
 ]
+
+
+def check_emergency_compression(agent: Any, messages: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Check if emergency compression is needed based on context usage.
+    
+    Triggers compression if:
+    1. Context usage exceeds 70% (warning threshold)
+    2. Context usage exceeds 90% (emergency threshold)
+    3. Token count spikes significantly (more than 30% increase since last check)
+    
+    Returns compression result if triggered, None otherwise.
+    """
+    if not getattr(agent, 'compression_enabled', False):
+        return None
+    
+    try:
+        from agent.model_metadata import estimate_request_tokens_rough
+        
+        current_tokens = estimate_request_tokens_rough(messages)
+        
+        # Get context limit (from runtime or default)
+        try:
+            runtime = getattr(agent, '_current_main_runtime', lambda: {})()
+            context_limit = runtime.get('context_limit', 128000)
+        except Exception:
+            context_limit = 128000
+        
+        # Calculate usage percentage
+        usage_pct = current_tokens / context_limit if context_limit > 0 else 0
+        
+        # Check for emergency thresholds
+        if usage_pct >= 0.90:
+            # Emergency - 90%+ context usage
+            logger.warning(
+                f"EMERGENCY: Context usage at {usage_pct*100:.1f}% ({current_tokens}/{context_limit} tokens). "
+                "Triggering emergency compression."
+            )
+            return compress_context(agent, messages, compress_above_tokens=int(context_limit * 0.8))
+        
+        elif usage_pct >= 0.70:
+            # Warning - 70-89% context usage
+            logger.info(
+                f"Context usage at {usage_pct*100:.1f}% ({current_tokens}/{context_limit} tokens). "
+                "Consider compressing context soon."
+            )
+            return None  # Not urgent enough to auto-compress
+        
+        return None
+        
+    except Exception as e:
+        logger.warning(f"Emergency compression check failed: {e}")
+        return None

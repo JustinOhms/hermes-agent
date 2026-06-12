@@ -4884,6 +4884,13 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 except Exception:
                     pass
             agent._on_model_change_callback = _on_model_change
+            # ── Register routing status callback for TUI model switch notifications ──
+            def _emit_routing_status(_sid, text):
+                try:
+                    _emit("status.update", _sid, {"kind": "routing", "text": text})
+                except Exception:
+                    pass
+            agent._emit_routing_status = _emit_routing_status
             # ─────────────────────────────────────────────────────────────────
 
             try:

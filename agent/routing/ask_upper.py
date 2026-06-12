@@ -151,6 +151,31 @@ class AskUpperTool:
     ) -> str:
         """Execute an ask_upper call. Returns guidance text or error message."""
 
+        # ── Early compression trigger for distill requests ──
+        # When the lower model requests distillation, it's a signal that
+        # context is getting unwieldy. Trigger compression proactively.
+        if request_type == "distill":
+            try:
+                from agent.conversation_compression import check_emergency_compression
+                # Get the agent reference from the parent class
+                agent = getattr(self, 'agent', None)
+                if agent:
+                    # Get current messages
+                    messages = getattr(agent, 'messages', None)
+                    if messages:
+                        # Check if compression is needed
+                        _result = check_emergency_compression(agent, messages)
+                        if _result:
+                            compressed, new_prompt = _result
+                            # Update agent's message list
+                            agent.messages = compressed
+                            # Update system prompt if needed
+                            if hasattr(agent, '_cached_system_prompt'):
+                                agent._cached_system_prompt = new_prompt
+                            logger.info("ask_upper(distill): early compression triggered")
+            except Exception:
+                pass  # Don't fail if compression fails
+
         # ── Budget check ──
         if self.budget.exhausted:
             return (

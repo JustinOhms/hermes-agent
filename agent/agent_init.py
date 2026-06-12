@@ -180,6 +180,8 @@ def init_agent(
     provider_data_collection: str = None,
     openrouter_min_coding_score: Optional[float] = None,
     session_id: str = None,
+    routing_log: list = None,
+    oversight_log: list = None,
     tool_progress_callback: callable = None,
     tool_start_callback: callable = None,
     tool_complete_callback: callable = None,
@@ -1003,6 +1005,11 @@ def init_agent(
     
     # Session logging setup - auto-save conversation trajectories for debugging
     agent.session_start = datetime.now()
+
+    # Routing and oversight logging
+    agent.routing_log = routing_log if routing_log is not None else []
+    agent.oversight_log = oversight_log if oversight_log is not None else []
+
     if session_id:
         # Use provided session ID (e.g., from CLI)
         agent.session_id = session_id

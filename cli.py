@@ -6535,6 +6535,51 @@ class HermesCLI:
         print(f"  Home:    {display}")
         print()
 
+
+    def _handle_routing_command(self):
+        """Display current routing state and recent routing decisions."""
+        print()
+        print("  Routing State")
+        print("  =============")
+        print()
+        
+        # Get current routing state
+        if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'routing'):
+            routing = self.agent.routing
+            print(f"  Current Position:    {routing.current_position}")
+            print(f"  Interaction Mode:    {routing.interaction_mode}")
+            print(f"  Autonomous Mode:     {routing.is_autonomous}")
+            print()
+            print("  Capability Graph:")
+            for node in routing.catalog.nodes:
+                active = " ✓" if node == routing.current_position else ""
+                print(f"    {node}{active}")
+        else:
+            print("  Routing not initialized.")
+        print()
+
+    def _handle_oversight_command(self):
+        """Display oversight history for the current session."""
+        print()
+        print("  Oversight History")
+        print("  =================")
+        print()
+        
+        if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'oversight_log'):
+            log = self.agent.oversight_log
+            if log:
+                for entry in log[-10:]:  # Show last 10
+                    action = entry.get("action", "unknown")
+                    timestamp = entry.get("timestamp", "")
+                    reason = entry.get("reason", "")
+                    print(f"  [{timestamp}] {action.upper()}")
+                    if reason:
+                        print(f"    {reason}")
+            else:
+                print("  No oversight actions this session.")
+        else:
+            print("  Oversight logging not available.")
+        print()
     def show_config(self):
         """Display current configuration with kawaii ASCII art."""
         # Get terminal config from environment (which was set from cli-config.yaml)
@@ -8831,6 +8876,10 @@ class HermesCLI:
             self.show_help()
         elif canonical == "profile":
             self._handle_profile_command()
+        elif canonical == "routing":
+            self._handle_routing_command()
+        elif canonical == "oversight":
+            self._handle_oversight_command()
         elif canonical == "tools":
             self._handle_tools_command(cmd_original)
         elif canonical == "toolsets":

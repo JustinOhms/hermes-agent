@@ -600,6 +600,39 @@ def run_oversight_if_due(
         turn_count, last_was_escalated, ask_user_if_budget_exhausted
     )
     
+    # Compress context before oversight review to reduce token count
+    # This is an oversight checkpoint - compress if context is getting large
+    if should_review:
+        try:
+            from agent.conversation_compression import compress_context
+            from agent.routing.config import _load_section
+            
+            # Check if compression is enabled
+            compression_cfg = _load_section(
+                getattr(agent, 'config', None) or {},
+                'model', 'compression'
+            )
+            if compression_cfg and compression_cfg.get('enabled', True):
+                # Get current token count estimate
+                try:
+                    from agent.model_metadata import estimate_request_tokens_rough
+                    current_tokens = estimate_request_tokens_rough(messages)
+                    # Compress if we're approaching 70% of context window
+                    context_limit = getattr(agent, '_current_main_runtime', lambda: {})().get('context_limit', 128000)
+                    if context_limit and current_tokens > context_limit * 0.7:
+                        logger.info(f"oversight checkpoint: compressing context ({current_tokens}/{context_limit} tokens)")
+                        compressed_messages, new_system_prompt = compress_context(
+                            agent, messages, compress_above_tokens=int(context_limit * 0.9)
+                        )
+                        messages = compressed_messages
+                        # Update agent's system prompt if needed
+                        if hasattr(agent, '_cached_system_prompt') and hasattr(agent, 'system_prompt'):
+                            agent._cached_system_prompt = new_system_prompt
+                except Exception as e:
+                    logger.warning(f"oversight checkpoint: compression check failed: {e}")
+        except ImportError:
+            pass  # compression not available, skip
+    
     if not should_review:
         if budget_exhausted:
             # Budget exhausted - signal to prompt user
