@@ -5031,6 +5031,17 @@ def run_conversation(
                         )
                     except Exception:
                         pass  # Best effort
+                    # Emit TUI status update for oversight result
+                    try:
+                        _emit_routing_status = getattr(agent, "_emit_routing_status", None)
+                        if callable(_emit_routing_status):
+                            sid = getattr(agent, "session_id", "")
+                            _emit_routing_status(
+                                sid,
+                                f"oversight: FLAG — {_oversight_result.warning[:80]}",
+                            )
+                    except Exception:
+                        pass
         except ImportError:
             pass  # Routing module not available
         except Exception as exc:
