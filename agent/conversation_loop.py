@@ -459,6 +459,24 @@ def run_conversation(
                 _effective.provider != agent.provider
                 or _effective.model != agent.model
             ):
+                # ── TUI model switch notification ──
+                # Emit status update for on-screen visible history
+                try:
+                    _on_model_change = getattr(agent, "_on_model_change_callback", None)
+                    if _on_model_change:
+                        # Fire the callback first (sets up fingerprint, etc.)
+                        _on_model_change(agent)
+                    # Emit routing status update for TUI visible history
+                    _emit_routing_status = getattr(agent, "_emit_routing_status", None)
+                    if _emit_routing_status and callable(_emit_routing_status):
+                        sid = getattr(agent, "session_id", "")
+                        _emit_routing_status(
+                            sid,
+                            f"routing: switching to {routing_decision.target_position} ({_effective.model})"
+                        )
+                except Exception:
+                    pass
+                
                 _routing_switch_model(
                     agent,
                     new_model=_effective.model,
@@ -473,15 +491,47 @@ def run_conversation(
                     _effective.model,
                     _effective.provider,
                 )
+                # Inject routing transition context for the new model
+                try:
+                    from agent.routing.oversight import (
+                        build_routing_transition_injection,
+                    )
+                    from agent.routing.fingerprint import resolve_fingerprint as _rfp
+                    current_fp = _rfp(agent)
+                    from_model = getattr(agent, "_last_routing_model", _effective.model)
+                    # Store the new model as last for next transition
+                    agent._last_routing_model = current_fp.model_id
+                    # Build injection based on transition type
+                    if routing_decision.target_position == "upper":
+                        transition_type = "escalate"
+                        reason = routing_decision.reason or "escalated by oversight"
+                    else:
+                        transition_type = "de-escalate"
+                        reason = routing_decision.reason or "routing optimization"
+                    injection = build_routing_transition_injection(
+                        transition_type=transition_type,
+                        from_model=from_model,
+                        to_model=current_fp.model_id,
+                        reason=reason,
+                    )
+                    # Insert after system prompt, before conversation history
+                    if api_messages and api_messages[0].get("role") == "system":
+                        api_messages.insert(1, injection)
+                    else:
+                        api_messages.insert(0, injection)
+                    logger.info(
+                        "routing_swap: injected transition context for %s",
+                        transition_type,
+                    )
+                except Exception as _inj_exc:
+                    logger.debug(
+                        "routing transition injection failed (non-fatal): %s",
+                        _inj_exc,
+                    )
                 # Resolve fingerprint immediately after swap so the TUI
                 # callback (if registered) can emit pre-streaming status.
                 try:
-                    from agent.routing.fingerprint import resolve_fingerprint as _rfp
-                    agent._current_fingerprint = _rfp(agent)
-                    # Fire the pre-turn model change callback (set by TUI gateway)
-                    _on_model_change = getattr(agent, "_on_model_change_callback", None)
-                    if _on_model_change:
-                        _on_model_change(agent)
+                    agent._current_fingerprint = current_fp
                 except Exception:
                     pass
         except Exception as _swap_exc:

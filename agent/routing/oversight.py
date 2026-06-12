@@ -588,6 +588,43 @@ def build_oversight_injection(result: OversightResult, oversight_model: str) -> 
     }
 
 
+def build_routing_transition_injection(
+    transition_type: str,
+    from_model: str,
+    to_model: str,
+    reason: str,
+    context: str = "",
+) -> Dict[str, str]:
+    """Build the message to inject when a routing transition occurs.
+
+    Used for escalation, de-escalation, manual upgrade/downgrade.
+
+    Args:
+        transition_type: One of "escalate", "de-escalate", "upgrade", "downgrade"
+        from_model: The model that was active before the transition
+        to_model: The model that is now active
+        reason: Why the transition occurred (escalation reason, user request, etc.)
+        context: Optional additional context (handback summary, user prompt, etc.)
+
+    Returns:
+        A system message dict ready to insert into the messages list.
+    """
+    context_part = ""
+    if context:
+        context_part = f"Context: {context}\n"
+    return {
+        "role": "system",
+        "content": (
+            f"[ROUTING TRANSITION: {transition_type.upper()}]\n"
+            f"Trigger: {reason}\n"
+            f"From: {from_model}\n"
+            f"To: {to_model}\n"
+            f"\n{context_part}"
+            f"You are now active. Proceed with the current task."
+        ),
+    }
+
+
 def _extract_review_window(
     messages: List[Dict[str, Any]],
     window_turns: int,
