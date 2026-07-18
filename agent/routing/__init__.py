@@ -156,6 +156,57 @@ def execute_routing_swap(
         return None
 
 
+def apply_turn_routing(agent: object, user_message: str) -> Optional[RoutingDecision]:
+    """Per-turn routing entry point for ``build_turn_context``.
+
+    Runs the Phase-1 decision and, when a swap is required, executes the
+    Phase-2 model swap — switching the agent's runtime for THIS turn. Wired to
+    fire after ``_restore_primary_runtime`` and before the ``pre_llm_call``
+    hook so the routed model is the one the turn actually uses. Fully
+    non-fatal: any error leaves the agent on its current model unchanged.
+
+    Returns the RoutingDecision (for callers/tests), or None when routing is
+    disabled or errored.
+    """
+    decision = get_routing_decision(agent, user_message)
+    if decision is None:
+        return None
+    logger.info(
+        "routing_decision: target=%s complexity=%.2f mode=%s reason=%s swap_required=%s",
+        decision.target_position,
+        decision.complexity_score,
+        decision.interaction_mode.value,
+        decision.reason,
+        decision.swap_required,
+    )
+    if not decision.swap_required:
+        return decision
+    try:
+        effective = execute_routing_swap(agent, decision)
+        if effective and (
+            effective.provider != getattr(agent, "provider", None)
+            or effective.model != getattr(agent, "model", None)
+        ):
+            from agent.agent_runtime_helpers import switch_model as _switch_model
+            _switch_model(
+                agent,
+                new_model=effective.model,
+                new_provider=effective.provider,
+                api_key=effective.api_key,
+                base_url=effective.base_url,
+                api_mode=effective.api_mode,
+            )
+            logger.info(
+                "routing_swap: %s → %s (%s)",
+                decision.target_position,
+                effective.model,
+                effective.provider,
+            )
+    except Exception as exc:
+        logger.debug("apply_turn_routing swap failed (non-fatal): %s", exc)
+    return decision
+
+
 # ── Internal helpers ────────────────────────────────────────────────────────
 
 
