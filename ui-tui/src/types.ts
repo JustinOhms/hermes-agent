@@ -164,6 +164,7 @@ export interface SessionInfo {
   } | null
   service_tier?: string
   skills: Record<string, string[]>
+  slot?: string
   system_prompt?: string
   tools: Record<string, string[]>
   update_behind?: number | null
