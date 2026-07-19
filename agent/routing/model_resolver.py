@@ -66,7 +66,15 @@ class ModelResolver:
         return self._is_local(pos.base_url, pos.llm_config_name)
 
     def current_local_model(self) -> Optional[str]:
-        """Query `llm status` to get the currently loaded local model name."""
+        """Query `llm status` for the config name of the model actually running.
+
+        Returns None if nothing is loaded (or the process isn't reported as
+        running) so callers don't mistake a stale `active` name for a live
+        server. `llm status` prints plain text (colors auto-disabled off a
+        TTY), not JSON — e.g.:
+            active:     coder-next
+            status:     running (pid=15961)
+        """
         try:
             proc = subprocess.run(
                 [_LLM_CLI, "status"],
@@ -74,10 +82,16 @@ class ModelResolver:
                 text=True,
                 timeout=5.0,
             )
-            if proc.returncode == 0:
-                import json
-                data = json.loads(proc.stdout)
-                return data.get("name")
+            if proc.returncode != 0:
+                return None
+            active = None
+            running = False
+            for line in proc.stdout.splitlines():
+                if line.startswith("active:"):
+                    active = line.split(":", 1)[1].strip()
+                elif line.startswith("status:"):
+                    running = line.split(":", 1)[1].strip().startswith("running")
+            return active if (active and running) else None
         except Exception as exc:
             logger.debug("current_local_model: llm status failed: %s", exc)
         return None

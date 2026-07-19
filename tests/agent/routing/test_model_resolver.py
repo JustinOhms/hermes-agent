@@ -150,15 +150,33 @@ class TestIsPositionLocal:
 
 class TestCurrentLocalModel:
     def test_parses_name_from_llm_status(self):
+        # `llm status` prints plain text (colors auto-disabled off a TTY), not JSON.
         cfg = _make_config_with_positions()
         resolver = ModelResolver(cfg)
         with patch("agent.routing.model_resolver.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(
                 returncode=0,
-                stdout='{"name": "coder-next", "pid": 1234}',
+                stdout=(
+                    "active:     coder-next\n"
+                    "status:     running (pid=1234)\n"
+                    "endpoint:   http://127.0.0.1:58080/v1\n"
+                ),
             )
             result = resolver.current_local_model()
         assert result == "coder-next"
+
+    def test_returns_none_when_active_but_not_running(self):
+        # `active` names the last-selected config even after the server has
+        # stopped — must not be mistaken for a live model.
+        cfg = _make_config_with_positions()
+        resolver = ModelResolver(cfg)
+        with patch("agent.routing.model_resolver.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="active:     coder-next\nstatus:     not running\n",
+            )
+            result = resolver.current_local_model()
+        assert result is None
 
     def test_returns_none_on_subprocess_failure(self):
         cfg = _make_config_with_positions()

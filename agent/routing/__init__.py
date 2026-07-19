@@ -242,7 +242,25 @@ def _get_or_create_swap_manager(agent: object, config: RoutingConfig) -> "SwapMa
 def _init_swap_manager_position(
     mgr: "SwapManager", agent: object, config: RoutingConfig
 ) -> None:
-    """Set swap manager's current position from agent's active model/provider."""
+    """Set swap manager's current position for a freshly created SwapManager.
+
+    SwapManager is cached per-agent-instance, so this runs fresh on every new
+    session (e.g. each cron turn) — prefer the model actually running on the
+    local server (via `llm status`) over guessing from the agent's own
+    provider/model, otherwise a fresh session with no memory of a prior swap
+    would conclude a swap is needed and redundantly restart an already-loaded
+    local model. Falls back to matching the agent's active model/provider
+    when nothing local is running (e.g. current position is a cloud model).
+    """
+    from agent.routing.model_resolver import ModelResolver
+
+    running_local = ModelResolver(config).current_local_model()
+    if running_local:
+        for name, pos in config.graph.items():
+            if pos.llm_config_name == running_local:
+                mgr.set_current_position(name)
+                return
+
     current_provider = getattr(agent, "provider", "")
     current_model = getattr(agent, "model", "")
     for name, pos in config.graph.items():
