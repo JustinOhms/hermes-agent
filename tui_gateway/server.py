@@ -12544,7 +12544,7 @@ def _handle_routing_command(sid: str, session: dict, agent, arg: str) -> str:
             # Update swap manager position tracking
             swap_mgr = getattr(agent, "_routing_swap_manager", None)
             if swap_mgr is not None:
-                swap_mgr.current_position = target_position
+                swap_mgr.set_current_position(target_position)
             # Set explicit override so auto-routing doesn't fight it
             setattr(agent, "_routing_explicit_override", target_position)
             _emit("session.info", sid, _session_info(agent))
