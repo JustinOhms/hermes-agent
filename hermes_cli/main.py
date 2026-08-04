@@ -11222,6 +11222,28 @@ def main():
     moa_parser.set_defaults(func=cmd_moa)
 
     # =========================================================================
+    # routing command — model routing status and control
+    # =========================================================================
+    from hermes_cli.commands_routing import cmd_routing
+
+    routing_parser = subparsers.add_parser(
+        "routing",
+        help="Model routing status and control",
+        description="Model routing status and control. Shows current position, mode, swap state, and routing history.",
+    )
+    routing_subparsers = routing_parser.add_subparsers(dest="routing_command")
+    routing_subparsers.add_parser("status", help="Show routing position, mode, swap state, last decision, drift")
+    routing_graph = routing_subparsers.add_parser("graph", help="Show configured positions with active marker")
+    routing_graph.add_argument("position", nargs="?", help="Position index to show (default: all)")
+    routing_swap = routing_subparsers.add_parser("swap", help="Force swap to a position (bypasses cost filter)")
+    routing_swap.add_argument("position", type=int, help="Position index to swap to")
+    routing_mode = routing_subparsers.add_parser("mode", help="Override mode detection")
+    routing_mode.add_argument("mode", choices=["interactive", "autonomous", "auto"], help="Mode to set")
+    routing_history = routing_subparsers.add_parser("history", help="Last 10 routing decisions with timestamps")
+    routing_oversight = routing_subparsers.add_parser("oversight", help="Show oversight decisions")
+    routing_parser.set_defaults(func=cmd_routing)
+
+    # =========================================================================
     # fallback command — manage the fallback provider chain
     # =========================================================================
     from hermes_cli.fallback_cmd import cmd_fallback

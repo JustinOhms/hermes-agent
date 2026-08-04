@@ -397,6 +397,16 @@ def build_turn_context(
     except Exception:
         pass
 
+    # ── Model routing (ADR-0040) ──
+    # Fire after the primary-runtime restore and before the pre_llm_call hook
+    # below, so a routed model swap is the one this turn actually uses. Wrapper
+    # keeps the core edit minimal; fully self-contained and non-fatal.
+    try:
+        from agent.routing import apply_turn_routing
+        apply_turn_routing(agent, user_message)
+    except Exception:
+        pass
+
     # Between-turns MCP refresh: an MCP server that finished connecting since
     # the previous turn (slow HTTP/OAuth servers routinely take 2-6s on a cold
     # connect, missing the bounded startup wait) lands in THIS turn's tool

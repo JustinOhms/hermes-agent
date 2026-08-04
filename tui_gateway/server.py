@@ -5134,6 +5134,18 @@ def _session_info(agent, session: dict | None = None) -> dict:
         warn = _probe_credentials(agent)
         if warn:
             info["credential_warning"] = warn
+    try:
+        from agent.routing.state import get_routing_state
+        rstate = get_routing_state(agent)
+        if rstate.enabled:
+            info["routing"] = {
+                "enabled": True,
+                "position": rstate.current_position,
+                "mode": rstate.interaction_mode,
+                "swap_state": rstate.swap_state,
+            }
+    except Exception:
+        pass
     return info
 
 
@@ -12470,6 +12482,146 @@ def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg
 
 
 
+def _handle_routing_command(sid: str, session: dict, agent, arg: str) -> str:
+    """Handle /routing subcommands inline in the gateway."""
+    import time as _time
+
+    subcommand, _, sub_arg = (arg or "status").partition(" ")
+    subcommand = subcommand.lower().strip()
+    sub_arg = sub_arg.strip()
+
+    try:
+        from agent.routing.state import get_routing_state
+        state = get_routing_state(agent)
+    except Exception as e:
+        return f"routing state unavailable: {e}"
+
+    if subcommand == "status":
+        lines = []
+        status_icon = "⚡" if state.enabled else "⏸"
+        lines.append(f"{status_icon} Model Routing: {'active' if state.enabled else 'disabled'}")
+        if state.enabled:
+            lines.append(f"Position: {state.current_position or 'unknown'}")
+            lines.append(f"Mode: {state.interaction_mode}")
+            lines.append(f"Swap state: {state.swap_state}")
+            if state.last_decision:
+                d = state.last_decision
+                complexity = getattr(d, "complexity_score", "?")
+                target = getattr(d, "target_position", "?")
+                lines.append(f"Last decision: target={target} complexity={complexity}")
+            if state.drift_alerts:
+                latest = state.drift_alerts[-1]
+                lines.append(f"Drift: {latest}")
+            else:
+                lines.append("Drift: none")
+        return "\n".join(lines)
+
+    elif subcommand == "graph":
+        try:
+            from agent.routing.config import load_routing_config
+            config = load_routing_config()
+        except Exception:
+            return "routing config not loaded"
+        if not config or not config.graph:
+            return "no graph configured"
+        lines = ["Graph positions:"]
+        for pos_name, pos_cfg in config.graph.items():
+            provider = getattr(pos_cfg, "provider", "?")
+            model = getattr(pos_cfg, "model", "?")
+            profile = getattr(pos_cfg, "profile", None)
+            speed = getattr(profile, "generation_tok_s", "?") if profile else "?"
+            active = " [ACTIVE]" if pos_name == state.current_position else ""
+            disabled = ""
+            if pos_name == "fast_fallback":
+                try:
+                    from agent.routing.config import load_routing_config as _lrc
+                    cfg = _lrc()
+                    if cfg and not cfg.de_escalation.enabled:
+                        disabled = " [de-escalation disabled]"
+                except Exception:
+                    pass
+            lines.append(f"  {pos_name}: {provider} / {model} ({speed} tok/s){active}{disabled}")
+        return "\n".join(lines)
+
+    elif subcommand == "swap":
+        if not sub_arg:
+            return "Usage: /routing swap <position>  (e.g. upper, interactive_lower, fast_fallback)"
+        target_position = sub_arg.lower().strip()
+        try:
+            from agent.routing.config import load_routing_config
+            config = load_routing_config()
+        except Exception:
+            return "routing config not loaded"
+        if not config or not config.graph:
+            return "no graph configured"
+        if target_position not in config.graph:
+            available = ", ".join(config.graph.keys())
+            return f"unknown position '{target_position}'. Available: {available}"
+        if target_position == state.current_position:
+            return f"already at position '{target_position}'"
+        # Execute the swap
+        pos_cfg = config.graph[target_position]
+        provider = getattr(pos_cfg, "provider", None)
+        model = getattr(pos_cfg, "model", None)
+        base_url = getattr(pos_cfg, "base_url", None)
+        api_key = getattr(pos_cfg, "api_key", None)
+        api_mode = getattr(pos_cfg, "api_mode", None)
+        if agent and hasattr(agent, "switch_model"):
+            agent.switch_model(
+                new_model=model,
+                new_provider=provider,
+                api_key=api_key,
+                base_url=base_url,
+                api_mode=api_mode,
+            )
+            # Update swap manager position tracking
+            swap_mgr = getattr(agent, "_routing_swap_manager", None)
+            if swap_mgr is not None:
+                swap_mgr.set_current_position(target_position)
+            # Set explicit override so auto-routing doesn't fight it
+            setattr(agent, "_routing_explicit_override", target_position)
+            _emit("session.info", sid, _session_info(agent))
+            return f"✓ Swapped to: {target_position} ({model})"
+        return "no active agent to swap"
+
+    elif subcommand == "mode":
+        if not sub_arg:
+            current_override = getattr(agent, "_routing_mode_override", None)
+            current = current_override or "auto"
+            return f"Mode: {state.interaction_mode} (override: {current})"
+        mode_val = sub_arg.lower().strip()
+        if mode_val not in ("interactive", "autonomous", "auto"):
+            return "Usage: /routing mode <interactive|autonomous|auto>"
+        if mode_val == "auto":
+            if agent:
+                setattr(agent, "_routing_mode_override", None)
+            return "Mode override cleared (now: auto-detect)"
+        else:
+            if agent:
+                setattr(agent, "_routing_mode_override", mode_val)
+            return f"Mode override: {mode_val} (was: {state.interaction_mode})"
+
+    elif subcommand == "history":
+        if not state.decision_history:
+            return "No routing decisions recorded yet."
+        lines = ["Recent routing decisions:"]
+        for d in state.decision_history[-10:]:
+            ts = getattr(d, "_timestamp", None)
+            ts_str = _time.strftime("%H:%M:%S", _time.localtime(ts)) if ts else "?"
+            target = getattr(d, "target_position", "?")
+            complexity = getattr(d, "complexity_score", "?")
+            mode = getattr(d, "interaction_mode", "?")
+            swap = getattr(d, "swap_required", False)
+            if isinstance(complexity, float):
+                complexity = f"{complexity:.2f}"
+            swap_str = " swap=yes" if swap else ""
+            lines.append(f"  [{ts_str}] target={target} complexity={complexity} mode={mode}{swap_str}")
+        return "\n".join(lines)
+
+    else:
+        return "Usage: /routing [status|graph|swap|mode|history]"
+
+
 def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
     """Apply side effects that must also hit the gateway's live agent."""
     parts = command.lstrip("/").split(None, 1)
@@ -12598,6 +12750,8 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             _emit("session.info", sid, _session_info(agent, session))
         elif name == "reload-mcp" and agent and hasattr(agent, "reload_mcp_tools"):
             agent.reload_mcp_tools()
+        elif name == "routing":
+            return _handle_routing_command(sid, session, agent, arg)
         elif name == "stop":
             from tools.process_registry import process_registry
 
