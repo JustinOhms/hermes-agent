@@ -2444,6 +2444,67 @@ class GatewaySlashCommandsMixin:
 
         return await _finish_switch()
 
+    async def _handle_routing_command(self, event: MessageEvent) -> str:
+        """Handle /routing command in the gateway.
+
+        Same surface as the CLI handler in commands_routing.py:
+            /routing                  — show routing status (default)
+            /routing status           — show position, mode, swap state, last decision, drift
+            /routing graph            — show configured positions with active marker
+            /routing swap <pos>       — force swap to a position
+            /routing mode <mode>      — override mode detection
+            /routing history          — last 10 routing decisions
+            /routing oversight        — show oversight decisions
+        """
+        args = event.get_command_args().strip()
+        parts = args.split() if args else []
+
+        if not parts:
+            # Default to status
+            parts = ["status"]
+
+        subcommand = parts[0].lower()
+        subcommand_args = " ".join(parts[1:]) if len(parts) > 1 else ""
+
+        # Import the CLI handler to reuse the logic
+        try:
+            from hermes_cli.commands_routing import cmd_routing
+            import argparse
+        except ImportError as e:
+            return f"❌ Could not import routing command: {e}"
+
+        # Create a mock args object
+        mock_args = argparse.Namespace()
+        mock_args.subcommand = subcommand
+        mock_args.routing_command = subcommand
+
+        if subcommand == "swap":
+            try:
+                mock_args.position = int(subcommand_args.strip())
+            except ValueError:
+                return "❌ Invalid position. Please provide an integer."
+        elif subcommand == "mode":
+            mock_args.mode = subcommand_args.strip()
+
+        # Run the command
+        try:
+            # Capture output by temporarily redirecting stdout
+            import sys
+            from io import StringIO
+
+            old_stdout = sys.stdout
+            sys.stdout = StringIO()
+
+            try:
+                cmd_routing(mock_args)
+                output = sys.stdout.getvalue()
+            finally:
+                sys.stdout = old_stdout
+
+            return output.strip() if output.strip() else "Routing command completed."
+        except Exception as e:
+            return f"❌ Routing error: {e}"
+
     async def _handle_codex_runtime_command(self, event: MessageEvent) -> str:
         """Handle /codex-runtime command in the gateway.
 
