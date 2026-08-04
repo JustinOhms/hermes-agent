@@ -421,6 +421,21 @@ def build_turn_context(
     except Exception:
         pass
 
+    # ── ask_upper tool registration (ADR-0040 §4) ──
+    # Re-evaluated EVERY turn and position-aware: apply_turn_routing() above may
+    # have swapped the active model to a lower- or upper-tier graph position, so
+    # the ask_upper schema must be added while a lower-tier model is active and
+    # stripped otherwise (upper models would be asking themselves). This runs in
+    # the per-turn prologue, before this turn's first API call assembles
+    # ``tools=`` from ``agent.tools`` — the same pre-request window the MCP
+    # refresh below uses — so the tool genuinely reaches the model. The helper
+    # is idempotent (add-or-remove by name) and non-fatal.
+    try:
+        from agent.routing.ask_upper import sync_ask_upper_registration
+        sync_ask_upper_registration(agent)
+    except Exception:
+        logger.debug("ask_upper registration skipped", exc_info=True)
+
     # Between-turns MCP refresh: an MCP server that finished connecting since
     # the previous turn (slow HTTP/OAuth servers routinely take 2-6s on a cold
     # connect, missing the bounded startup wait) lands in THIS turn's tool

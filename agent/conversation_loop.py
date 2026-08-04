@@ -1107,6 +1107,16 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
         effective = sp
         if agent.ephemeral_system_prompt:
             effective = (effective + "\n\n" + agent.ephemeral_system_prompt).strip()
+        # Preserve the ask_upper nudge across a mid-turn provider failover so a
+        # lower-tier model keeps its escalation cue (see run_conversation). Same
+        # gate; non-fatal.
+        try:
+            from agent.routing.ask_upper import ask_upper_prompt_nudge as _au_nudge
+            _au_line = _au_nudge(agent)
+            if _au_line:
+                effective = (effective + "\n\n" + _au_line).strip()
+        except Exception:
+            pass
         if not _rewrite_system_content_blocks(api_messages[0], effective):
             api_messages[0]["content"] = effective
     return sp
@@ -1839,6 +1849,19 @@ def run_conversation(
         effective_system = active_system_prompt or ""
         if agent.ephemeral_system_prompt:
             effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
+        # ── ask_upper nudge (ADR-0040 §4) ──
+        # Encourage the lower-tier model to consult the upper model. Injected
+        # here at API-call time (NOT the cached ``active_system_prompt``) so it
+        # stays out of the prefix cache and is re-evaluated every turn; gated
+        # identically to ask_upper tool registration so upper-tier models never
+        # see it. Non-fatal.
+        try:
+            from agent.routing.ask_upper import ask_upper_prompt_nudge as _au_nudge
+            _au_line = _au_nudge(agent)
+            if _au_line:
+                effective_system = (effective_system + "\n\n" + _au_line).strip()
+        except Exception:
+            pass
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 

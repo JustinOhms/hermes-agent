@@ -274,6 +274,31 @@ class AskUpperTool:
 
 
 # ---------------------------------------------------------------------------
+# Lower-tier prompt nudge
+# ---------------------------------------------------------------------------
+
+ASK_UPPER_PROMPT_NUDGE = (
+    "You are currently running as a fast, lower-tier model. If a task is "
+    "complex, requires a multi-step plan, or you are unsure how to proceed, "
+    "call the `ask_upper` tool to consult the stronger upper model for "
+    "guidance, then continue the work yourself."
+)
+
+
+def ask_upper_prompt_nudge(agent: object) -> str:
+    """Return the lower-tier prompt nudge, or ``""`` when it should not apply.
+
+    Gated on exactly the same condition as tool registration
+    (:func:`should_register_ask_upper`) so upper-tier models never see it.
+    Non-fatal: any failure yields no nudge.
+    """
+    try:
+        return ASK_UPPER_PROMPT_NUDGE if should_register_ask_upper(agent) else ""
+    except Exception:
+        return ""
+
+
+# ---------------------------------------------------------------------------
 # Registration helper
 # ---------------------------------------------------------------------------
 
@@ -303,6 +328,53 @@ def should_register_ask_upper(agent: object) -> bool:
         # Model not in graph — conservative: don't register
         return False
     except Exception:
+        return False
+
+
+def sync_ask_upper_registration(agent: object) -> bool:
+    """Add or remove the ask_upper tool on ``agent`` for the current turn.
+
+    Idempotent and position-aware: appends ``ASK_UPPER_TOOL_SCHEMA`` (wrapped in
+    the OpenAI ``{"type": "function", "function": ...}`` envelope that
+    ``agent.tools`` uses) and registers the name in ``agent.valid_tool_names``
+    while :func:`should_register_ask_upper` holds, and strips both when it does
+    not. Called each turn from the per-turn prologue, AFTER routing may have
+    swapped the model tier and BEFORE the request's ``tools=`` is assembled.
+
+    Returns True when ask_upper is present on ``agent.tools`` after the call.
+    Non-fatal — never raises.
+    """
+    try:
+        want = should_register_ask_upper(agent)
+        tools = getattr(agent, "tools", None) or []
+
+        def _is_ask_upper(entry: object) -> bool:
+            return (
+                isinstance(entry, dict)
+                and entry.get("function", {}).get("name") == "ask_upper"
+            )
+
+        has = any(_is_ask_upper(t) for t in tools)
+
+        if want and not has:
+            if getattr(agent, "tools", None) is None:
+                agent.tools = []
+            agent.tools.append(
+                {"type": "function", "function": ASK_UPPER_TOOL_SCHEMA}
+            )
+            names = getattr(agent, "valid_tool_names", None)
+            if names is not None:
+                names.add("ask_upper")
+            return True
+        if has and not want:
+            agent.tools = [t for t in tools if not _is_ask_upper(t)]
+            names = getattr(agent, "valid_tool_names", None)
+            if names is not None:
+                names.discard("ask_upper")
+            return False
+        return has
+    except Exception:
+        logger.debug("sync_ask_upper_registration failed", exc_info=True)
         return False
 
 
