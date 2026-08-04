@@ -1,6 +1,12 @@
 # ADR-0044: Runtime robustness (stream backpressure, tool watchdog, live iteration cap)
 
 **Status:** Accepted (carried patch) — documented 2026-08-03
+**Update 2026-08-04:** the rederived sequential-tool watchdog shipped a real bug
+— it caught the worker thread's exception with `except Exception`, swallowing
+`KeyboardInterrupt` (a `BaseException`) so tool-interrupt semantics broke. Fixed
+in `961ebd805` (catch `BaseException`, re-raise on the caller thread); guarded by
+two `tests/run_agent` interrupt node-ids now in the deploy gate's blocking tier.
+See ADR-0045.
 **Source of record:** `archive/fixes/stream-delta-backpressure`
 **Upstream:** the stream-writer piece is PR **#37633** (still OPEN as of 2026-08-03).
 
