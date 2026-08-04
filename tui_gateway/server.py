@@ -7096,6 +7096,96 @@ def _append_inflight_delta(session: dict, delta: Any) -> None:
     session["inflight_turn"] = turn
 
 
+# ── Non-blocking stream delta writer ─────────────────────────────────
+# Prevents stdout backpressure from blocking the provider streaming thread.
+# When the stdout pipe buffer is full, write_json blocks in
+# StdioTransport.write.  If this happens inside the stream_callback (called
+# from the provider thread), the interrupt mechanism cannot fire — the
+# provider thread is stuck in a write syscall and never advances to the
+# interrupt check.
+#
+# StreamDeltaWriter interposes a bounded queue between the provider thread
+# and the stdout write.  If the queue fills up (writer can't drain fast
+# enough), deltas are dropped — a cosmetic loss only, since the full
+# response text is assembled from the final message list, not from deltas
+# (and the in-memory inflight buffer is fed synchronously on the provider
+# thread, so it stays complete even when stdout deltas drop).  The provider
+# thread never blocks on stdout, so interrupt checks continue to fire
+# promptly.
+#
+# Upstream equivalent: PR #37633 (not merged upstream as of this fork).
+
+
+class StreamDeltaWriter:
+    """Async writer that decouples stream deltas from stdout backpressure.
+
+    Usage::
+
+        writer = StreamDeltaWriter(sid, streamer, max_queue=256)
+        writer.start()
+        # ... use writer.push(delta) as (part of) the stream_callback ...
+        writer.stop()  # drain remaining + join thread
+    """
+
+    __slots__ = ("_sid", "_streamer", "_queue", "_thread", "_stop_event")
+
+    def __init__(self, sid: str, streamer, *, max_queue: int = 256):
+        self._sid = sid
+        self._streamer = streamer
+        self._queue: queue.Queue = queue.Queue(maxsize=max_queue)
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> "StreamDeltaWriter":
+        self._thread = threading.Thread(
+            target=self._drain_loop, name="stream-delta-writer", daemon=True
+        )
+        self._thread.start()
+        return self
+
+    def push(self, delta: str) -> None:
+        """Enqueue a delta for async writing. Drops if queue is full."""
+        try:
+            self._queue.put_nowait(delta)
+        except queue.Full:
+            # Drop delta — cosmetic loss. The full response is assembled
+            # from result["messages"], not from streamed deltas.
+            pass
+
+    def stop(self, timeout: float = 2.0) -> None:
+        """Signal stop and wait for the writer thread to drain and exit."""
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=timeout)
+
+    def _drain_loop(self) -> None:
+        """Drain queued deltas to _emit until stopped."""
+        while not self._stop_event.is_set():
+            try:
+                delta = self._queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            self._emit_delta(delta)
+        # Final drain — flush anything remaining after stop signal
+        while True:
+            try:
+                delta = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            self._emit_delta(delta)
+
+    def _emit_delta(self, delta: str) -> None:
+        payload = {"text": delta}
+        if self._streamer:
+            try:
+                r = self._streamer.feed(delta)
+                if r is not None:
+                    payload["rendered"] = r
+            except Exception:
+                pass
+        _emit("message.delta", self._sid, payload)
+
+
 def _record_inflight_correction(session: dict, text: Any) -> None:
     """Record an accepted mid-turn correction on the live turn.
 
@@ -9597,15 +9687,21 @@ def _run_prompt_submit(
                 elif isinstance(run_message, list):
                     run_message = [{"type": "text", "text": reaction_notes}, *run_message]
 
+            # Non-blocking stream delta writer — decouples the provider
+            # streaming thread from stdout backpressure (see StreamDeltaWriter).
+            # The cheap in-memory side effects (inflight buffer + TTS feed) stay
+            # synchronous on the provider thread so they never drop; only the
+            # stdout-bound message.delta emit (and streamer rendering) is
+            # offloaded to the writer's queue, which may drop under sustained
+            # backpressure rather than stall generation and its interrupt check.
+            delta_writer = StreamDeltaWriter(sid, streamer).start()
+
             def _stream(delta):
                 with session["history_lock"]:
                     _append_inflight_delta(session, delta)
-                payload = {"text": delta}
-                if streamer and (r := streamer.feed(delta)) is not None:
-                    payload["rendered"] = r
                 if tts_queue is not None and isinstance(delta, str):
                     tts_queue.put(delta)
-                _emit("message.delta", sid, payload)
+                delta_writer.push(delta)
 
             # Surface interim assistant text (commentary emitted alongside
             # tool calls, or the attempted final answer before a verify-on-stop
@@ -9645,7 +9741,12 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
-            result = agent.run_conversation(run_message, **run_kwargs)
+            try:
+                result = agent.run_conversation(run_message, **run_kwargs)
+            finally:
+                # Stop the writer — drains remaining queued deltas (or discards
+                # on interrupt).  Must run even on exception to join the thread.
+                delta_writer.stop()
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
                 current_session_id = getattr(agent, "session_id", None) or session.get("session_key")
