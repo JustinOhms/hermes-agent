@@ -1421,10 +1421,12 @@ def _invoke_with_watchdog(agent, function_name: str, invoke):
     Behaviour, mirroring the concurrent path's recovery as closely as the
     sequential structure allows:
       * On success, returns ``invoke()``'s result unchanged.
-      * If ``invoke()`` raises, the exception is re-raised on the caller
-        thread so the existing ``except`` handling at the call site is
-        preserved (including KeyboardInterrupt semantics, which are delivered
-        to the main thread while it waits in ``join``).
+      * If ``invoke()`` raises, the exception (any ``BaseException``, so
+        KeyboardInterrupt/SystemExit included — a worker-thread exception is
+        NOT surfaced by ``join`` on its own) is stashed on the worker and
+        re-raised on the caller thread so the existing ``except`` handling at
+        the call site is preserved, including the cancelled-post-tool-hook /
+        emit-results-for-all-calls interrupt semantics.
       * On watchdog expiry, requests interrupt on the (registered) worker
         thread via ``_ra()._set_interrupt`` — best-effort unwedge for
         interrupt-aware tools — abandons the worker (left running detached,
@@ -1454,7 +1456,7 @@ def _invoke_with_watchdog(agent, function_name: str, invoke):
             pass
         try:
             result_holder[0] = invoke()
-        except Exception as exc:  # noqa: BLE001 — re-raised on the caller thread
+        except BaseException as exc:  # noqa: BLE001 — stashed and re-raised on the caller thread (incl. KeyboardInterrupt/SystemExit)
             error_holder[0] = exc
         finally:
             try:
