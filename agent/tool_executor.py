@@ -1629,6 +1629,39 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('todo', function_args, tool_duration, result=function_result)}")
+        elif function_name == "ask_upper":
+            # Cooperative routing escalation (ADR-0040 §4): the lower-tier model
+            # queries the upper model for guidance and continues working. Not a
+            # registry tool — routed here (never parallel-safe, so it always
+            # lands on the sequential path). The AskUpperTool is cached on the
+            # agent so per-session budget tracking persists across calls.
+            def _execute(next_args: dict) -> Any:
+                from agent.routing.ask_upper import get_or_create_ask_upper_tool
+                _au_tool = get_or_create_ask_upper_tool(agent)
+                if _au_tool is None:
+                    return (
+                        "[ask_upper UNAVAILABLE] Model routing is not enabled or "
+                        "no upper-tier model is configured. Proceed with your "
+                        "best judgment."
+                    )
+                return _au_tool.execute(
+                    request_type=next_args.get("request_type", ""),
+                    question=next_args.get("question", ""),
+                    context=next_args.get("context", "") or "",
+                )
+            function_result, function_args, middleware_trace, _execution_blocked = _managed_values(_run_agent_tool_execution_middleware(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                execute=_execute,
+                scope_block=_ts_scope_block,
+                display_index=i,
+            ))
+            tool_duration = time.time() - tool_start_time
+            if agent._should_emit_quiet_tool_messages():
+                agent._vprint(f"  {_get_cute_tool_message_impl('ask_upper', function_args, tool_duration, result=function_result)}")
         elif function_name == "session_search":
             def _execute(next_args: dict) -> Any:
                 session_db = agent._get_session_db_for_recall()
