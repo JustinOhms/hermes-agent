@@ -12368,6 +12368,8 @@ _LIVE_SESSION_DIRECT_COMMANDS = frozenset(
         "models",
         "prompt",
         "rename",
+        "route",
+        "routing",
         "status",
         "usage",
     }
@@ -12556,6 +12558,14 @@ def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg
     arg = arg or ""
     if name == "model" and not arg.strip():
         return _format_live_model_output(session or {})
+    # Routing is handled entirely server-side against the live agent (the CLI
+    # surface is out-of-process and can't touch this session). Short-circuit
+    # here so the slash-worker doesn't also run and emit stub/"unknown" noise.
+    if name in ("routing", "route"):
+        agent = (session or {}).get("agent")
+        if name == "route":
+            return _route_apply(sid, session or {}, agent, arg)
+        return _handle_routing_command(sid, session or {}, agent, arg)
     if name not in _LIVE_SESSION_DIRECT_COMMANDS:
         if not (
             name in _ISOLATED_SESSION_READ_COMMANDS
@@ -12611,6 +12621,87 @@ def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg
 
 
 
+def _route_apply(sid: str, session: dict, agent, selector: str) -> str:
+    """Resolve a ``/route`` (or ``/routing swap``) selector and apply it to the
+    live agent, pinning it so auto-routing won't revert it.
+
+    Selector accepts: a tier number (``2``), a position key or ``alias``
+    (``Beta``), ``up``/``down`` (one step relative to the current position), or
+    ``auto``/``clear`` (release the pin and resume auto-routing). Empty selector
+    shows the ladder.
+    """
+    sel = (selector or "").strip()
+    try:
+        from agent.routing.config import load_routing_config
+        config = load_routing_config()
+    except Exception:
+        return "routing config not loaded"
+    if not config or not config.graph:
+        return "no graph configured"
+
+    if not sel:
+        return _handle_routing_command(sid, session, agent, "graph")
+
+    low = sel.lower()
+    if low in ("auto", "clear", "none", "off"):
+        if agent is not None:
+            setattr(agent, "_routing_explicit_override", None)
+        return "✓ Manual routing pin released — auto-routing resumed"
+
+    # Resolve the current position (for relative up/down + no-op detection).
+    current = None
+    swap_mgr = getattr(agent, "_routing_swap_manager", None)
+    if swap_mgr is not None:
+        current = swap_mgr.current_position
+    if current is None:
+        cp, cm = getattr(agent, "provider", ""), getattr(agent, "model", "")
+        for k, p in config.graph.items():
+            if p.provider == cp and p.model == cm:
+                current = k
+                break
+
+    if low == "up":
+        target = config.position_above(current)
+        if target is None:
+            return f"already at the top tier ({current or '?'}) — nothing higher"
+    elif low == "down":
+        target = config.position_below(current)
+        if target is None:
+            return f"already at the base tier ({current or '?'}) — nothing lower"
+    else:
+        target = config.resolve_label(sel)
+        if target is None:
+            avail = ", ".join(
+                f"{p.tier}:{p.alias or k}"
+                for k, p in sorted(config.graph.items(), key=lambda kv: kv[1].tier)
+            )
+            return f"unknown route '{sel}'. Available — {avail} (or up / down / auto)"
+
+    pos_cfg = config.graph[target]
+    if target == current:
+        return f"already on {pos_cfg.alias or target} (tier {pos_cfg.tier})"
+    if not (agent and hasattr(agent, "switch_model")):
+        return "no active agent to route"
+
+    agent.switch_model(
+        new_model=getattr(pos_cfg, "model", None),
+        new_provider=getattr(pos_cfg, "provider", None),
+        api_key=getattr(pos_cfg, "api_key", None),
+        base_url=getattr(pos_cfg, "base_url", None),
+        api_mode=getattr(pos_cfg, "api_mode", None),
+    )
+    if swap_mgr is not None:
+        swap_mgr.set_current_position(target)
+    setattr(agent, "_routing_explicit_override", target)  # pin against auto-routing
+    try:
+        _emit("session.info", sid, _session_info(agent))
+    except Exception:
+        pass
+    label = pos_cfg.alias or target
+    return (f"✓ Routed to {label} (tier {pos_cfg.tier}, {pos_cfg.model}) — "
+            f"pinned; '/route auto' to release")
+
+
 def _handle_routing_command(sid: str, session: dict, agent, arg: str) -> str:
     """Handle /routing subcommands inline in the gateway."""
     import time as _time
@@ -12653,71 +12744,22 @@ def _handle_routing_command(sid: str, session: dict, agent, arg: str) -> str:
             return "routing config not loaded"
         if not config or not config.graph:
             return "no graph configured"
-        lines = ["Graph positions:"]
-        for pos_name, pos_cfg in config.graph.items():
+        lines = ["Routing pipeline (low → high):"]
+        for pos_name in config.ordered_positions():
+            pos_cfg = config.graph[pos_name]
             provider = getattr(pos_cfg, "provider", "?")
             model = getattr(pos_cfg, "model", "?")
+            alias = getattr(pos_cfg, "alias", "") or pos_name
+            tier = getattr(pos_cfg, "tier", 0)
             profile = getattr(pos_cfg, "profile", None)
             speed = getattr(profile, "generation_tok_s", "?") if profile else "?"
-            active = " [ACTIVE]" if pos_name == state.current_position else ""
-            disabled = ""
-            if pos_name == "fast_fallback":
-                try:
-                    from agent.routing.config import load_routing_config as _lrc
-                    cfg = _lrc()
-                    if cfg and not cfg.de_escalation.enabled:
-                        disabled = " [de-escalation disabled]"
-                except Exception:
-                    pass
-            lines.append(f"  {pos_name}: {provider} / {model} ({speed} tok/s){active}{disabled}")
+            active = " ← current" if pos_name == state.current_position else ""
+            lines.append(f"  [{tier}] {alias}: {provider} / {model} ({speed} tok/s){active}")
+        lines.append("Route with:  /route <tier#|name|up|down|auto>")
         return "\n".join(lines)
 
     elif subcommand == "swap":
-        if not sub_arg:
-            return ("Usage: /routing swap <position|auto>  "
-                    "(positions: upper, interactive_lower, fast_fallback; "
-                    "'auto' releases a manual pin and resumes auto-routing)")
-        target_position = sub_arg.lower().strip()
-        if target_position in ("auto", "clear", "none"):
-            if agent is not None:
-                setattr(agent, "_routing_explicit_override", None)
-            return "✓ Manual routing pin released — auto-routing resumed"
-        try:
-            from agent.routing.config import load_routing_config
-            config = load_routing_config()
-        except Exception:
-            return "routing config not loaded"
-        if not config or not config.graph:
-            return "no graph configured"
-        if target_position not in config.graph:
-            available = ", ".join(config.graph.keys())
-            return f"unknown position '{target_position}'. Available: {available}"
-        if target_position == state.current_position:
-            return f"already at position '{target_position}'"
-        # Execute the swap
-        pos_cfg = config.graph[target_position]
-        provider = getattr(pos_cfg, "provider", None)
-        model = getattr(pos_cfg, "model", None)
-        base_url = getattr(pos_cfg, "base_url", None)
-        api_key = getattr(pos_cfg, "api_key", None)
-        api_mode = getattr(pos_cfg, "api_mode", None)
-        if agent and hasattr(agent, "switch_model"):
-            agent.switch_model(
-                new_model=model,
-                new_provider=provider,
-                api_key=api_key,
-                base_url=base_url,
-                api_mode=api_mode,
-            )
-            # Update swap manager position tracking
-            swap_mgr = getattr(agent, "_routing_swap_manager", None)
-            if swap_mgr is not None:
-                swap_mgr.set_current_position(target_position)
-            # Set explicit override so auto-routing doesn't fight it
-            setattr(agent, "_routing_explicit_override", target_position)
-            _emit("session.info", sid, _session_info(agent))
-            return f"✓ Swapped to: {target_position} ({model}) — pinned; '/routing swap auto' to release"
-        return "no active agent to swap"
+        return _route_apply(sid, session, agent, sub_arg)
 
     elif subcommand == "mode":
         if not sub_arg:
@@ -12754,7 +12796,8 @@ def _handle_routing_command(sid: str, session: dict, agent, arg: str) -> str:
         return "\n".join(lines)
 
     else:
-        return "Usage: /routing [status|graph|swap|mode|history]"
+        return ("Usage: /routing [status|graph|mode|history]  or  "
+                "/route <tier#|name|up|down|auto>")
 
 
 def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
@@ -12887,6 +12930,9 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             agent.reload_mcp_tools()
         elif name == "routing":
             return _handle_routing_command(sid, session, agent, arg)
+        elif name == "route":
+            # Shorthand: /route <tier#|name|up|down|auto> — no "swap" subcommand.
+            return _route_apply(sid, session, agent, arg)
         elif name == "stop":
             from tools.process_registry import process_registry
 
