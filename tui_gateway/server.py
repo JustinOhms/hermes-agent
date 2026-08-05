@@ -12674,8 +12674,14 @@ def _handle_routing_command(sid: str, session: dict, agent, arg: str) -> str:
 
     elif subcommand == "swap":
         if not sub_arg:
-            return "Usage: /routing swap <position>  (e.g. upper, interactive_lower, fast_fallback)"
+            return ("Usage: /routing swap <position|auto>  "
+                    "(positions: upper, interactive_lower, fast_fallback; "
+                    "'auto' releases a manual pin and resumes auto-routing)")
         target_position = sub_arg.lower().strip()
+        if target_position in ("auto", "clear", "none"):
+            if agent is not None:
+                setattr(agent, "_routing_explicit_override", None)
+            return "✓ Manual routing pin released — auto-routing resumed"
         try:
             from agent.routing.config import load_routing_config
             config = load_routing_config()
@@ -12710,7 +12716,7 @@ def _handle_routing_command(sid: str, session: dict, agent, arg: str) -> str:
             # Set explicit override so auto-routing doesn't fight it
             setattr(agent, "_routing_explicit_override", target_position)
             _emit("session.info", sid, _session_info(agent))
-            return f"✓ Swapped to: {target_position} ({model})"
+            return f"✓ Swapped to: {target_position} ({model}) — pinned; '/routing swap auto' to release"
         return "no active agent to swap"
 
     elif subcommand == "mode":
