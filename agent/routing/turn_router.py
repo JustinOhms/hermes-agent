@@ -91,67 +91,58 @@ class TurnRouter:
         self._mode_detector = mode_detector
 
     def route(self, context: RoutingContext) -> RoutingDecision:
-        """Classify a turn and return the routing decision."""
-        from agent.routing.interaction_mode import InteractionMode
+        """Classify a turn and return the routing decision.
 
+        Relative-tier model (ADR-0041): the graph is an ordered pipeline by
+        ``tier``. We sit on the base (lowest) tier by default and escalate one
+        step up when a turn is complex; de-escalation (if enabled) steps down.
+        The top tier is reserved for a manual ``/route`` — auto-routing never
+        burns it. There are no more hardcoded role names.
+        """
+        cfg = self._config
         complexity = self._score_complexity(context)
         mode = context.interaction_mode
 
-        # Subagent: don't reroute — let delegation.model handle it
-        if context.is_subagent:
-            reason = "subagent context — respecting delegation model"
-            logger.debug("routing: subagent → interactive_lower")
+        base = cfg.base_position()
+        if base is None:
             return RoutingDecision(
-                target_position="interactive_lower",
+                target_position="",
                 complexity_score=complexity,
                 interaction_mode=mode,
-                reason=reason,
+                reason="no graph configured",
                 swap_required=False,
             )
 
-        # Autonomous mode
-        if mode == InteractionMode.AUTONOMOUS:
-            if complexity >= self._config.complexity.escalation_threshold:
-                target = "upper"
-                reason = (
-                    f"autonomous + high complexity ({complexity:.2f} ≥ "
-                    f"{self._config.complexity.escalation_threshold})"
-                )
-            else:
-                target = "autonomous_lower"
-                reason = f"autonomous mode (complexity={complexity:.2f})"
+        # Subagent: stay on the base (local) model — respect delegation.
+        if context.is_subagent:
             return RoutingDecision(
-                target_position=target,
+                target_position=base,
                 complexity_score=complexity,
                 interaction_mode=mode,
-                reason=reason,
-                swap_required=self._swap_required(target),
+                reason="subagent context — base tier",
+                swap_required=False,
             )
 
-        # Interactive mode
-        if complexity >= self._config.complexity.escalation_threshold:
-            target = "upper"
+        if complexity >= cfg.complexity.escalation_threshold:
+            target = cfg.position_above(base) or base   # one step up from base
             reason = (
                 f"high complexity ({complexity:.2f} ≥ "
-                f"{self._config.complexity.escalation_threshold})"
+                f"{cfg.complexity.escalation_threshold}) → escalate to {target}"
             )
         elif (
-            self._config.de_escalation.enabled
-            and complexity <= self._config.complexity.de_escalation_threshold
+            cfg.de_escalation.enabled
+            and complexity <= cfg.complexity.de_escalation_threshold
         ):
-            target = "fast_fallback"
+            target = cfg.position_below(base) or base
             reason = (
                 f"low complexity ({complexity:.2f} ≤ "
-                f"{self._config.complexity.de_escalation_threshold})"
+                f"{cfg.complexity.de_escalation_threshold}) → de-escalate to {target}"
             )
         else:
-            target = "interactive_lower"
-            reason = f"interactive mode (complexity={complexity:.2f})"
+            target = base
+            reason = f"nominal complexity ({complexity:.2f}) → base tier {base}"
 
-        logger.debug(
-            "routing: target=%s complexity=%.2f reason=%s",
-            target, complexity, reason,
-        )
+        logger.debug("routing: target=%s complexity=%.2f reason=%s", target, complexity, reason)
         return RoutingDecision(
             target_position=target,
             complexity_score=complexity,

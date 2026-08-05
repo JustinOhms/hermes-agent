@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from agent.routing.config import ComplexityConfig, DeEscalationConfig, RoutingConfig
+from agent.routing.config import (
+    ComplexityConfig,
+    DeEscalationConfig,
+    GraphPosition,
+    RoutingConfig,
+)
 from agent.routing.interaction_mode import InteractionMode, InteractionModeDetector
 from agent.routing.turn_router import RoutingContext, RoutingDecision, TurnRouter
 
@@ -15,6 +20,12 @@ def _make_config(
     de_escalation_enabled: bool = False,
 ) -> RoutingConfig:
     cfg = RoutingConfig(enabled=True)
+    # Ordered tier pipeline: alpha (base) → beta → gamma.
+    cfg.graph = {
+        "alpha": GraphPosition(provider="custom:llm-local", model="qwen-local", tier=1, alias="Alpha"),
+        "beta": GraphPosition(provider="openai-codex", model="gpt-5.6-terra", tier=2, alias="Beta"),
+        "gamma": GraphPosition(provider="openai-codex", model="gpt-5.6-sol", tier=3, alias="Gamma"),
+    }
     cfg.complexity = ComplexityConfig(
         escalation_threshold=escalation_threshold,
         de_escalation_threshold=de_escalation_threshold,
@@ -134,57 +145,59 @@ class TestComplexityScoring:
 
 
 class TestRoutingDecisions:
-    def test_simple_message_routes_to_interactive_lower(self):
+    def test_simple_message_routes_to_base(self):
         router = _make_router()
         ctx = _make_context("ok", interaction_mode=InteractionMode.INTERACTIVE)
         decision = router.route(ctx)
-        assert decision.target_position == "interactive_lower"
+        assert decision.target_position == "alpha"  # base (lowest) tier
 
-    def test_high_complexity_routes_to_upper(self):
+    def test_high_complexity_escalates_one_tier(self):
         router = _make_router(escalation_threshold=0.1)
         msg = "Refactor the entire architecture across multiple files and explain the tradeoffs."
         ctx = _make_context(msg, interaction_mode=InteractionMode.INTERACTIVE)
         decision = router.route(ctx)
-        assert decision.target_position == "upper"
+        assert decision.target_position == "beta"  # one step up from base (not the top)
 
-    def test_cron_context_routes_autonomous_lower(self):
+    def test_autonomous_nominal_routes_base(self):
+        # Mode no longer selects a different local — both modes seat at base.
         router = _make_router()
         ctx = _make_context("run the daily report", is_cron=True, interaction_mode=InteractionMode.AUTONOMOUS)
         decision = router.route(ctx)
-        assert decision.target_position == "autonomous_lower"
+        assert decision.target_position == "alpha"
         assert decision.interaction_mode == InteractionMode.AUTONOMOUS
 
-    def test_cron_context_high_complexity_routes_upper(self):
+    def test_autonomous_high_complexity_escalates(self):
         router = _make_router(escalation_threshold=0.1)
         msg = "Refactor everything across multiple files with full analysis."
         ctx = _make_context(msg, is_cron=True, interaction_mode=InteractionMode.AUTONOMOUS)
         decision = router.route(ctx)
-        assert decision.target_position == "upper"
+        assert decision.target_position == "beta"
 
-    def test_subagent_always_interactive_lower(self):
+    def test_subagent_always_base(self):
         router = _make_router(escalation_threshold=0.1)
-        # Even very complex message from subagent stays on interactive_lower
+        # Even a very complex subagent turn stays on the base tier.
         msg = "Refactor the architecture across multiple files and analyze performance."
         ctx = _make_context(msg, is_subagent=True)
         decision = router.route(ctx)
-        assert decision.target_position == "interactive_lower"
+        assert decision.target_position == "alpha"
         assert "subagent" in decision.reason
 
-    def test_de_escalation_disabled_never_fast_fallback(self):
+    def test_de_escalation_disabled_stays_at_base(self):
         router = _make_router(de_escalation_enabled=False)
-        # Very simple message
         ctx = _make_context("ok", interaction_mode=InteractionMode.INTERACTIVE)
         decision = router.route(ctx)
-        assert decision.target_position != "fast_fallback"
+        assert decision.target_position == "alpha"
 
-    def test_de_escalation_enabled_routes_fast_fallback(self):
+    def test_de_escalation_from_base_is_a_noop(self):
+        # Base is already the lowest tier, so de-escalation has nowhere lower to
+        # go and stays put (implicit: nominal turns already return to base).
         router = _make_router(
-            de_escalation_threshold=0.9,  # Very high threshold — easy to be below
+            de_escalation_threshold=0.9,  # easy to be below
             de_escalation_enabled=True,
         )
         ctx = _make_context("ok", interaction_mode=InteractionMode.INTERACTIVE)
         decision = router.route(ctx)
-        assert decision.target_position == "fast_fallback"
+        assert decision.target_position == "alpha"
 
     def test_routing_decision_has_reason(self):
         router = _make_router()

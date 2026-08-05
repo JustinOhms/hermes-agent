@@ -322,8 +322,9 @@ def should_register_ask_upper(agent: object) -> bool:
 
         for name, pos in config.graph.items():
             if pos.provider == current_provider and pos.model == current_model:
-                # Don't register for upper models (they'd be asking themselves)
-                return name != "upper"
+                # Register only if there's a higher tier to ask (nothing above
+                # the top tier to consult).
+                return config.position_above(name) is not None
 
         # Model not in graph — conservative: don't register
         return False
@@ -392,8 +393,20 @@ def get_or_create_ask_upper_tool(agent: object) -> Optional[AskUpperTool]:
         if not config.enabled:
             return None
 
-        # Get upper model config from graph
-        upper_pos = config.graph.get("upper")
+        # Ask the tier immediately ABOVE the current model (relative), so a
+        # routine consult hits the next rung up rather than always burning the
+        # top tier. Fall back to the top tier if the current model isn't in the
+        # graph.
+        current_provider = getattr(agent, "provider", "")
+        current_model = getattr(agent, "model", "")
+        target_name: Optional[str] = None
+        for name, pos in config.graph.items():
+            if pos.provider == current_provider and pos.model == current_model:
+                target_name = config.position_above(name)
+                break
+        if target_name is None:
+            target_name = config.top_position()
+        upper_pos = config.graph.get(target_name) if target_name else None
         if not upper_pos:
             return None
 

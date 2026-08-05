@@ -26,6 +26,8 @@ class GraphPosition:
     api_mode: str = ""
     api_key: str = ""
     llm_config_name: str = ""  # name for `llm start <name>`; set for local models
+    tier: int = 0             # capability rank in the pipeline (higher = more capable)
+    alias: str = ""           # user-facing name, e.g. "Alpha" (addressable via /route)
 
 
 @dataclass
@@ -54,6 +56,65 @@ class RoutingConfig:
     complexity: ComplexityConfig = field(default_factory=ComplexityConfig)
     de_escalation: DeEscalationConfig = field(default_factory=DeEscalationConfig)
 
+    # ── Relative-tier navigation ────────────────────────────────────────────
+    # The graph is an ordered pipeline by `tier` (higher = more capable). The
+    # engine reasons relatively — "is there a tier above me to escalate to, one
+    # below to drop to" — instead of hardcoded role names. See ADR-0041.
+
+    def ordered_positions(self) -> list[str]:
+        """Graph position keys sorted by tier ascending (least→most capable)."""
+        return sorted(self.graph, key=lambda k: (self.graph[k].tier, k))
+
+    def base_position(self) -> Optional[str]:
+        """Lowest-tier position — the default seat."""
+        ordered = self.ordered_positions()
+        return ordered[0] if ordered else None
+
+    def top_position(self) -> Optional[str]:
+        """Highest-tier position."""
+        ordered = self.ordered_positions()
+        return ordered[-1] if ordered else None
+
+    def position_above(self, name: Optional[str]) -> Optional[str]:
+        """Next position up the pipeline from ``name`` (None if at/above top)."""
+        ordered = self.ordered_positions()
+        if name not in ordered:
+            return None
+        i = ordered.index(name)
+        return ordered[i + 1] if i + 1 < len(ordered) else None
+
+    def position_below(self, name: Optional[str]) -> Optional[str]:
+        """Next position down the pipeline from ``name`` (None if at/below base)."""
+        ordered = self.ordered_positions()
+        if name not in ordered:
+            return None
+        i = ordered.index(name)
+        return ordered[i - 1] if i > 0 else None
+
+    def resolve_label(self, selector: str) -> Optional[str]:
+        """Resolve a user selector to a graph position key.
+
+        Accepts the position key, its ``alias`` (case-insensitive), or a tier
+        number (as ``str`` or ``int``). Returns None if nothing matches.
+        """
+        if selector is None:
+            return None
+        sel = str(selector).strip()
+        if not sel:
+            return None
+        low = sel.lower()
+        if low in self.graph:
+            return low
+        for key, pos in self.graph.items():
+            if key.lower() == low or (pos.alias and pos.alias.lower() == low):
+                return key
+        if sel.isdigit():
+            want = int(sel)
+            for key, pos in self.graph.items():
+                if pos.tier == want:
+                    return key
+        return None
+
 
 def _parse_profile(raw: Dict[str, Any]) -> GraphPositionProfile:
     return GraphPositionProfile(
@@ -78,6 +139,8 @@ def _parse_graph(raw: Dict[str, Any]) -> Dict[str, GraphPosition]:
             api_mode=str(pos_raw.get("api_mode", "")),
             api_key=str(pos_raw.get("api_key", "")),
             llm_config_name=str(pos_raw.get("llm_config_name", "")),
+            tier=int(pos_raw.get("tier", 0) or 0),
+            alias=str(pos_raw.get("alias", "")),
         )
     return positions
 
