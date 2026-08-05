@@ -21,6 +21,7 @@ from agent.routing.ask_upper import (
     get_or_create_ask_upper_tool,
     sync_ask_upper_registration,
 )
+from agent.routing.config import GraphPosition, RoutingConfig
 
 
 # ---------------------------------------------------------------------------
@@ -28,15 +29,19 @@ from agent.routing.ask_upper import (
 # ---------------------------------------------------------------------------
 
 def _routing_config(*, enabled=True):
-    """A routing config with an upper + a lower graph position."""
-    config = MagicMock(enabled=enabled)
-    config.graph = {
-        "upper": MagicMock(provider="bedrock", model="opus", base_url="", api_key=""),
-        "interactive_lower": MagicMock(
-            provider="local", model="qwen", base_url="", api_key=""
-        ),
-    }
-    return config
+    """A real routing config (tier-navigation must resolve) with a base local
+    tier and an upper tier above it."""
+    return RoutingConfig(
+        enabled=enabled,
+        graph={
+            "interactive_lower": GraphPosition(
+                provider="local", model="qwen", base_url="", api_key="", tier=1, alias="Alpha"
+            ),
+            "upper": GraphPosition(
+                provider="bedrock", model="opus", base_url="", api_key="", tier=2, alias="Beta"
+            ),
+        },
+    )
 
 
 def _agent(provider, model):

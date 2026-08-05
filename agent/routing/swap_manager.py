@@ -108,8 +108,11 @@ class SwapManager:
                 self._state = SwapState.IDLE
                 state = SwapState.IDLE
 
-        # Escalation to upper model: always immediate
-        if target == "upper":
+        # Escalation (moving UP the tier pipeline): always immediate.
+        def _tier(pos: Optional[str]) -> int:
+            gp = self._config.graph.get(pos) if pos else None
+            return gp.tier if gp else 0
+        if _tier(target) > _tier(current):
             return True
 
         # Autonomous→interactive transition (lazy swap-back, RD-16)

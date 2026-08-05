@@ -13,6 +13,19 @@ from agent.routing.ask_upper import (
     get_or_create_ask_upper_tool,
     should_register_ask_upper,
 )
+from agent.routing.config import GraphPosition, RoutingConfig
+
+
+def _two_tier_config() -> RoutingConfig:
+    """Real config (not a MagicMock) so tier-navigation helpers work: a base
+    local tier and an upper tier above it."""
+    return RoutingConfig(
+        enabled=True,
+        graph={
+            "interactive_lower": GraphPosition(provider="local", model="qwen", tier=1, alias="Alpha"),
+            "upper": GraphPosition(provider="bedrock", model="opus", base_url="", api_key="", tier=2, alias="Beta"),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -222,38 +235,22 @@ class TestShouldRegisterAskUpper:
         assert not should_register_ask_upper(agent)
 
     @patch("agent.routing.config.load_routing_config")
-    def test_upper_model_not_registered(self, mock_config):
-        config = MagicMock(enabled=True)
-        config.graph = {
-            "upper": MagicMock(provider="bedrock", model="opus"),
-            "interactive_lower": MagicMock(provider="local", model="qwen"),
-        }
-        mock_config.return_value = config
-
+    def test_top_tier_not_registered(self, mock_config):
+        # Model at the top tier has nothing above to ask → not registered.
+        mock_config.return_value = _two_tier_config()
         agent = MagicMock(provider="bedrock", model="opus")
         assert not should_register_ask_upper(agent)
 
     @patch("agent.routing.config.load_routing_config")
     def test_lower_model_registered(self, mock_config):
-        config = MagicMock(enabled=True)
-        config.graph = {
-            "upper": MagicMock(provider="bedrock", model="opus"),
-            "interactive_lower": MagicMock(provider="local", model="qwen"),
-        }
-        mock_config.return_value = config
-
+        # Base tier has a tier above → registered.
+        mock_config.return_value = _two_tier_config()
         agent = MagicMock(provider="local", model="qwen")
         assert should_register_ask_upper(agent)
 
     @patch("agent.routing.config.load_routing_config")
     def test_unknown_model_not_registered(self, mock_config):
-        config = MagicMock(enabled=True)
-        config.graph = {
-            "upper": MagicMock(provider="bedrock", model="opus"),
-            "interactive_lower": MagicMock(provider="local", model="qwen"),
-        }
-        mock_config.return_value = config
-
+        mock_config.return_value = _two_tier_config()
         agent = MagicMock(provider="openai", model="gpt-4")
         assert not should_register_ask_upper(agent)
 
@@ -261,17 +258,15 @@ class TestShouldRegisterAskUpper:
 class TestGetOrCreateAskUpperTool:
     @patch("agent.routing.config.load_routing_config")
     def test_creates_and_caches(self, mock_config):
-        config = MagicMock(enabled=True)
-        upper = MagicMock(provider="bedrock", model="opus", base_url="", api_key="")
-        config.graph = {"upper": upper}
-        mock_config.return_value = config
+        # Agent not found in the graph → falls back to the top tier to ask.
+        mock_config.return_value = _two_tier_config()
 
-        agent = MagicMock(spec=[])  # No attributes set
+        agent = MagicMock(spec=["_ask_upper_tool"])  # no provider/model attrs
         agent._ask_upper_tool = None
 
         tool = get_or_create_ask_upper_tool(agent)
         assert tool is not None
-        assert tool.upper_provider == "bedrock"
+        assert tool.upper_provider == "bedrock"  # top tier ("upper")
         assert tool.upper_model == "opus"
 
     @patch("agent.routing.config.load_routing_config")
