@@ -46,6 +46,17 @@ def get_routing_decision(agent: object, user_message: str) -> Optional[RoutingDe
         router = TurnRouter(config, detector)
         decision = router.route(context)
 
+        # ── Manual position pin ──────────────────────────────────────────────
+        # `/routing swap <pos>` sets `agent._routing_explicit_override` to force
+        # a position. Honor it here so per-turn auto-routing does not revert a
+        # user-forced swap on the next message. Cleared by `/routing swap auto`
+        # (sets the attribute back to None). Invalid/stale pins are ignored.
+        manual_pos = getattr(agent, "_routing_explicit_override", None)
+        if manual_pos and manual_pos in config.graph:
+            if decision.target_position != manual_pos:
+                decision.target_position = manual_pos
+                decision.reason = f"manual override → {manual_pos}"
+
         # ── Phase 2: update swap_required based on current routing position ──
         try:
             swap_mgr = _get_or_create_swap_manager(agent, config)
@@ -281,5 +292,10 @@ def _build_context(user_message: str, agent: object, mode: InteractionMode) -> R
         interaction_mode=mode,
         recent_tool_calls=list(getattr(agent, "_recent_tool_calls", []) or [])[-5:],
         last_response_had_errors=getattr(agent, "_last_response_had_errors", False),
-        explicit_mode_override=getattr(agent, "_explicit_mode_override", None),
+        # `/routing mode <m>` writes `_routing_mode_override`; older/test code
+        # uses `_explicit_mode_override`. Honor whichever is set (TUI name first).
+        explicit_mode_override=(
+            getattr(agent, "_routing_mode_override", None)
+            or getattr(agent, "_explicit_mode_override", None)
+        ),
     )
