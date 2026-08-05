@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.routing import get_routing_decision
-from agent.routing.config import RoutingConfig
+from agent.routing.config import GraphPosition, RoutingConfig
 from agent.routing.interaction_mode import InteractionMode
 from agent.routing.turn_router import RoutingDecision
 
@@ -30,6 +30,11 @@ def _make_agent(**kwargs) -> SimpleNamespace:
 
 def _enabled_config() -> RoutingConfig:
     cfg = RoutingConfig(enabled=True)
+    cfg.graph = {
+        "alpha": GraphPosition(provider="custom:llm-local", model="qwen-local", tier=1, alias="Alpha"),
+        "beta": GraphPosition(provider="openai-codex", model="gpt-5.6-terra", tier=2, alias="Beta"),
+        "gamma": GraphPosition(provider="openai-codex", model="gpt-5.6-sol", tier=3, alias="Gamma"),
+    }
     return cfg
 
 
@@ -49,16 +54,14 @@ class TestGetRoutingDecisionEnabled:
         agent = _make_agent()
         with patch("agent.routing.load_routing_config", return_value=_enabled_config()):
             result = get_routing_decision(agent, "hello")
-        assert result.target_position in {
-            "interactive_lower", "autonomous_lower", "upper", "fast_fallback"
-        }
+        assert result.target_position in {"alpha", "beta", "gamma"}
 
-    def test_simple_message_routes_interactive_lower(self):
+    def test_simple_message_routes_base(self):
         agent = _make_agent()
         with patch("agent.routing.load_routing_config", return_value=_enabled_config()):
             result = get_routing_decision(agent, "ok")
         assert result is not None
-        assert result.target_position == "interactive_lower"
+        assert result.target_position == "alpha"  # base tier
 
     def test_cron_agent_gets_autonomous_mode(self):
         agent = _make_agent(is_cron=True)
@@ -67,12 +70,12 @@ class TestGetRoutingDecisionEnabled:
         assert result is not None
         assert result.interaction_mode == InteractionMode.AUTONOMOUS
 
-    def test_subagent_always_interactive_lower(self):
+    def test_subagent_always_base(self):
         agent = _make_agent(is_subagent=True)
         with patch("agent.routing.load_routing_config", return_value=_enabled_config()):
             result = get_routing_decision(agent, "complex task with refactoring")
         assert result is not None
-        assert result.target_position == "interactive_lower"
+        assert result.target_position == "alpha"  # base tier
 
     def test_detector_cached_on_agent(self):
         agent = _make_agent()

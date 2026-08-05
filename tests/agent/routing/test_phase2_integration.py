@@ -22,7 +22,7 @@ from agent.routing.turn_router import RoutingDecision
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def _local_pos(llm_config_name: str, model: str = "") -> GraphPosition:
+def _local_pos(llm_config_name: str, model: str = "", tier: int = 0) -> GraphPosition:
     return GraphPosition(
         provider="custom:llm-local",
         model=model or f"model-{llm_config_name}",
@@ -30,27 +30,30 @@ def _local_pos(llm_config_name: str, model: str = "") -> GraphPosition:
         api_mode="chat_completions",
         llm_config_name=llm_config_name,
         profile=GraphPositionProfile(ttft_p90_ms=800.0, generation_tok_s=60.0),
+        tier=tier,
     )
 
 
-def _cloud_pos(provider: str = "bedrock", model: str = "claude-opus") -> GraphPosition:
+def _cloud_pos(provider: str = "bedrock", model: str = "claude-opus", tier: int = 0) -> GraphPosition:
     return GraphPosition(
         provider=provider,
         model=model,
         base_url="",
         api_mode="anthropic_messages",
         llm_config_name="",
+        tier=tier,
     )
 
 
 def _make_full_config() -> RoutingConfig:
+    # Ordered pipeline: interactive_lower is the base (lowest tier).
     return RoutingConfig(
         enabled=True,
         graph={
-            "interactive_lower": _local_pos("coder", model="qwen3-coder"),
-            "autonomous_lower": _local_pos("prose", model="qwen3-prose"),
-            "upper": _cloud_pos("bedrock", "claude-opus-4"),
-            "fast_fallback": _local_pos("fast", model="qwen3-fast"),
+            "interactive_lower": _local_pos("coder", model="qwen3-coder", tier=1),
+            "autonomous_lower": _local_pos("prose", model="qwen3-prose", tier=2),
+            "fast_fallback": _local_pos("fast", model="qwen3-fast", tier=3),
+            "upper": _cloud_pos("bedrock", "claude-opus-4", tier=4),
         },
     )
 
