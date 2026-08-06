@@ -12796,8 +12796,12 @@ def _handle_routing_command(sid: str, session: dict, agent, arg: str) -> str:
         return "\n".join(lines)
 
     else:
-        return ("Usage: /routing [status|graph|mode|history]  or  "
-                "/route <tier#|name|up|down|auto>")
+        # Bare selector sugar: `/routing gamma` / `/routing 2` / `/routing up`
+        # behave like `/route <selector>` — the `swap` keyword is optional.
+        # _route_apply resolves the whole arg (tier#|key|alias|up|down|auto) and
+        # returns a helpful "unknown route …" list with available tiers on a miss,
+        # which is strictly more useful than the old static usage string.
+        return _route_apply(sid, session, agent, arg)
 
 
 def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
