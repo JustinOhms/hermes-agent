@@ -4,6 +4,14 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 
 **Never give up on the right solution.**
 
+> **⚠️ Patched fork (JustinOhms/hermes-agent) — fork rules live in [`.ai/`](.ai/).**
+> This checkout is a patched fork deployed via blue/green slots, not plain
+> upstream. **Before any deploy, slot, or branch action, read
+> [`.ai/operations.md`](.ai/operations.md).** Edit only the working copy — editing
+> a running slot directly WILL break the live agent. This block and `.ai/` are
+> carried by the `feat/agent-meta` living patch; everything else in this file is
+> upstream content. (Upstream / plain clones can ignore this note.)
+
 ## What Hermes Is
 
 Hermes is a personal AI agent that runs the same agent core across a CLI, a
