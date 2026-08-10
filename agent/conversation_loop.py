@@ -410,6 +410,51 @@ def _ra():
     return run_agent
 
 
+def _refresh_max_iterations(agent) -> int:
+    """Re-read agent.max_turns from config.yaml if it has changed on disk.
+
+    The TUI server creates an AIAgent once per session and reuses it across
+    turns.  If the user bumps ``agent.max_turns`` in config mid-session (e.g.
+    from 120 to 1000), the in-memory agent.max_iterations stays stale until
+    a /new.  This function provides a hot-reload path: called once per turn
+    before the iteration budget is created.
+
+    Returns the (possibly updated) max_iterations value.
+    """
+    try:
+        import yaml
+        from hermes_constants import get_hermes_home
+        # Env var takes priority (matches _cfg_max_turns in tui_gateway/server.py)
+        try:
+            env_max = int(os.environ.get("HERMES_TUI_MAX_TURNS", "") or 0)
+            if env_max > 0:
+                return env_max
+        except (TypeError, ValueError):
+            pass
+        cfg_path = get_hermes_home() / "config.yaml"
+        if not cfg_path.exists():
+            return agent.max_iterations
+        mtime = cfg_path.stat().st_mtime
+        # Cache to avoid re-parsing unchanged files every turn
+        prev_mtime = getattr(agent, "_cfg_max_turns_mtime", None)
+        if prev_mtime == mtime:
+            return agent.max_iterations
+        with open(cfg_path) as f:
+            data = yaml.safe_load(f) or {}
+        agent._cfg_max_turns_mtime = mtime
+        agent_cfg = data.get("agent") or {}
+        new_val = int(agent_cfg.get("max_turns") or data.get("max_turns") or agent.max_iterations)
+        if new_val != agent.max_iterations:
+            logger.info(
+                "max_iterations refreshed from config: %d -> %d (session=%s)",
+                agent.max_iterations, new_val, agent.session_id or "none",
+            )
+        return new_val
+    except Exception:
+        # Never crash the conversation loop for a config-refresh failure.
+        return agent.max_iterations
+
+
 def _nous_entitlement_message(capability: str) -> str:
     try:
         from hermes_cli.nous_account import (
