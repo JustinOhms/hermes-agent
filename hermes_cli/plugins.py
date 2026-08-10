@@ -216,6 +216,13 @@ VALID_HOOKS: Set[str] = {
     "kanban_task_claimed",
     "kanban_task_completed",
     "kanban_task_blocked",
+    # Failover decision hook. Fired inside the retry loop just before the
+    # fallback chain is activated. Plugins can redirect, retry, or abort.
+    # Return values: {"action": "redirect", "model": "...", "provider": "..."}
+    #                {"action": "retry"} (suppress fallback, retry same provider)
+    #                {"action": "abort", "message": "..."} (stop retry loop)
+    #                None/{} (no-op, proceed with normal fallback chain)
+    "pre_failover_decision",
 }
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"

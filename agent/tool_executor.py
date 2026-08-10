@@ -138,6 +138,18 @@ class _BatchAbandoned(BaseException):
     """
 
 
+# Hard last-resort timeout (seconds) for a SINGLE tool on the sequential
+# execution path.  Unlike the concurrent path (guarded by
+# _resolve_concurrent_tool_timeout), execute_tool_calls_sequential has no
+# batch deadline, so a barrier/interactive tool that wedges past its own
+# internal timeout — terminal, execute_code, write_file/patch, a deadlocked
+# approval flow, or a non-parallel-safe MCP server — could hang the whole
+# turn indefinitely.  The watchdog runs the invocation on a worker thread and
+# abandons it on expiry.  Override via HERMES_SEQUENTIAL_TOOL_TIMEOUT_S; set
+# it to 0 (or negative) to disable the backstop entirely.
+_DEFAULT_SEQUENTIAL_TOOL_TIMEOUT_S = 300.0
+
+
 def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
     """Parse model-emitted arguments without repairing or coercing them."""
     try:
@@ -170,6 +182,30 @@ def _resolve_concurrent_tool_timeout() -> float | None:
             _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S,
         )
         return _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S
+    if value <= 0:
+        return None
+    return value
+
+
+def _resolve_sequential_tool_timeout() -> float | None:
+    """Hard-timeout backstop for the sequential path; None disables it.
+
+    Mirrors _resolve_concurrent_tool_timeout: reads
+    HERMES_SEQUENTIAL_TOOL_TIMEOUT_S, falls back to
+    _DEFAULT_SEQUENTIAL_TOOL_TIMEOUT_S, and treats <= 0 as "disabled".
+    """
+    raw = os.getenv("HERMES_SEQUENTIAL_TOOL_TIMEOUT_S", "").strip()
+    if not raw:
+        return _DEFAULT_SEQUENTIAL_TOOL_TIMEOUT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "invalid HERMES_SEQUENTIAL_TOOL_TIMEOUT_S=%r; using %.0fs",
+            raw,
+            _DEFAULT_SEQUENTIAL_TOOL_TIMEOUT_S,
+        )
+        return _DEFAULT_SEQUENTIAL_TOOL_TIMEOUT_S
     if value <= 0:
         return None
     return value
@@ -1600,6 +1636,111 @@ def _append_cancelled_tool_results(messages: list, tool_calls, *, reason: str) -
         ))
 
 
+def _invoke_with_watchdog(agent, function_name: str, invoke):
+    """Run ``invoke()`` (a zero-arg tool invocation) under a hard-timeout
+    backstop on a worker thread.
+
+    The sequential execution path has no batch deadline like the concurrent
+    path's ``_resolve_concurrent_tool_timeout``, so a barrier/interactive tool
+    that wedges past its own internal timeout (terminal, execute_code,
+    write_file/patch, a deadlocked approval flow, an unresponsive
+    non-parallel-safe MCP server) would otherwise hang the whole turn.  This
+    is the last-resort backstop.
+
+    Behaviour, mirroring the concurrent path's recovery as closely as the
+    sequential structure allows:
+      * On success, returns ``invoke()``'s result unchanged.
+      * If ``invoke()`` raises, the exception (any ``BaseException``, so
+        KeyboardInterrupt/SystemExit included — a worker-thread exception is
+        NOT surfaced by ``join`` on its own) is stashed on the worker and
+        re-raised on the caller thread so the existing ``except`` handling at
+        the call site is preserved, including the cancelled-post-tool-hook /
+        emit-results-for-all-calls interrupt semantics.
+      * On watchdog expiry, requests interrupt on the (registered) worker
+        thread via ``_ra()._set_interrupt`` — best-effort unwedge for
+        interrupt-aware tools — abandons the worker (left running detached,
+        same tradeoff the concurrent path takes), and returns a
+        ``tool_timeout`` error string so downstream records a proper tool
+        result and the turn continues instead of blocking forever.
+
+    Disabled (runs ``invoke()`` inline) when HERMES_SEQUENTIAL_TOOL_TIMEOUT_S
+    is set to 0 or negative.
+    """
+    timeout = _resolve_sequential_tool_timeout()
+    if timeout is None:
+        return invoke()
+
+    result_holder: list = [None]
+    error_holder: list = [None]
+    worker_tid_holder: list = [None]
+
+    def _run():
+        worker_tid_holder[0] = threading.current_thread().ident
+        # Register the worker so interrupt signals can target it (parity with
+        # the concurrent path, which registers each ThreadPoolExecutor tid).
+        try:
+            with agent._tool_worker_threads_lock:
+                agent._tool_worker_threads.add(worker_tid_holder[0])
+        except Exception:
+            pass
+        try:
+            result_holder[0] = invoke()
+        except BaseException as exc:  # noqa: BLE001 — stashed and re-raised on the caller thread (incl. KeyboardInterrupt/SystemExit)
+            error_holder[0] = exc
+        finally:
+            try:
+                with agent._tool_worker_threads_lock:
+                    agent._tool_worker_threads.discard(worker_tid_holder[0])
+            except Exception:
+                pass
+
+    worker = threading.Thread(
+        target=_run, name=f"seq-tool-watchdog:{function_name}", daemon=True
+    )
+    worker.start()
+    worker.join(timeout=timeout)
+
+    if worker.is_alive():
+        logger.error(
+            "WATCHDOG: sequential tool '%s' exceeded %.0fs timeout — "
+            "requesting interrupt and abandoning the worker",
+            function_name, timeout,
+        )
+        agent._vprint(
+            f"{agent.log_prefix}🐕 Watchdog: '{function_name}' hung past "
+            f"{int(timeout)}s — interrupting and abandoning it.",
+            force=True,
+        )
+        # Best-effort unwedge: set the interrupt flag and signal every
+        # registered worker tid, so interrupt-aware tools can unwind.
+        try:
+            agent._interrupt_requested = True
+            _tid = worker_tid_holder[0]
+            if _tid is not None:
+                _ra()._set_interrupt(True, _tid)
+            with agent._tool_worker_threads_lock:
+                _tids = list(agent._tool_worker_threads)
+            for _t in _tids:
+                try:
+                    _ra()._set_interrupt(True, _t)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Brief grace period for an interrupt-aware tool to notice and exit.
+        worker.join(timeout=5.0)
+        return (
+            f"Error executing tool '{function_name}': tool watchdog timeout "
+            f"after {int(timeout)}s — the tool hung past its own internal "
+            f"timeout and was abandoned. Set HERMES_SEQUENTIAL_TOOL_TIMEOUT_S "
+            f"to tune the backstop (0 disables it)."
+        )
+
+    if error_holder[0] is not None:
+        raise error_holder[0]
+    return result_holder[0]
+
+
 def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools.
 
@@ -1746,6 +1887,39 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('todo', function_args, tool_duration, result=function_result)}")
+        elif function_name == "ask_upper":
+            # Cooperative routing escalation (ADR-0040 §4): the lower-tier model
+            # queries the upper model for guidance and continues working. Not a
+            # registry tool — routed here (never parallel-safe, so it always
+            # lands on the sequential path). The AskUpperTool is cached on the
+            # agent so per-session budget tracking persists across calls.
+            def _execute(next_args: dict) -> Any:
+                from agent.routing.ask_upper import get_or_create_ask_upper_tool
+                _au_tool = get_or_create_ask_upper_tool(agent)
+                if _au_tool is None:
+                    return (
+                        "[ask_upper UNAVAILABLE] Model routing is not enabled or "
+                        "no upper-tier model is configured. Proceed with your "
+                        "best judgment."
+                    )
+                return _au_tool.execute(
+                    request_type=next_args.get("request_type", ""),
+                    question=next_args.get("question", ""),
+                    context=next_args.get("context", "") or "",
+                )
+            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                execute=_execute,
+                scope_block=_ts_scope_block,
+                display_index=i,
+            ))
+            tool_duration = time.time() - tool_start_time
+            if agent._should_emit_quiet_tool_messages():
+                agent._vprint(f"  {_get_cute_tool_message_impl('ask_upper', function_args, tool_duration, result=function_result)}")
         elif function_name == "session_search":
             def _execute(next_args: dict) -> Any:
                 session_db = agent._get_session_db_for_recall()
@@ -2022,27 +2196,36 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             _spinner_result = None
             try:
                 def _execute(next_args: dict) -> Any:
-                    return _ra().handle_function_call(
-                        function_name,
-                        next_args,
-                        effective_task_id,
-                        tool_call_id=tool_call.id,
-                        session_id=agent.session_id or "",
-                        turn_id=getattr(agent, "_current_turn_id", "") or "",
-                        api_request_id=getattr(agent, "_current_api_request_id", "")
-                        or "",
-                        enabled_tools=(
-                            list(agent.valid_tool_names)
-                            if agent.valid_tool_names
-                            else None
-                        ),
-                        skip_pre_tool_call_hook=True,
-                        skip_tool_request_middleware=True,
-                        skip_tool_execution_middleware=True,
-                        tool_request_middleware_trace=list(middleware_trace),
-                        enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                        disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                    )
+                    # Sequential path has no batch deadline; guard the raw
+                    # (post-approval) tool dispatch with the hard-timeout
+                    # backstop so a wedged tool cannot hang the turn. The
+                    # middleware around _execute — which owns approval/
+                    # interactive prompting — still runs on this thread; only
+                    # handle_function_call runs on the watchdog worker.
+                    def _call():
+                        return _ra().handle_function_call(
+                            function_name,
+                            next_args,
+                            effective_task_id,
+                            tool_call_id=tool_call.id,
+                            session_id=agent.session_id or "",
+                            turn_id=getattr(agent, "_current_turn_id", "") or "",
+                            api_request_id=getattr(agent, "_current_api_request_id", "")
+                            or "",
+                            enabled_tools=(
+                                list(agent.valid_tool_names)
+                                if agent.valid_tool_names
+                                else None
+                            ),
+                            skip_pre_tool_call_hook=True,
+                            skip_tool_request_middleware=True,
+                            skip_tool_execution_middleware=True,
+                            tool_request_middleware_trace=list(middleware_trace),
+                            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                        )
+
+                    return _invoke_with_watchdog(agent, function_name, _call)
 
                 (
                     function_result,
@@ -2101,27 +2284,36 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         else:
             try:
                 def _execute(next_args: dict) -> Any:
-                    return _ra().handle_function_call(
-                        function_name,
-                        next_args,
-                        effective_task_id,
-                        tool_call_id=tool_call.id,
-                        session_id=agent.session_id or "",
-                        turn_id=getattr(agent, "_current_turn_id", "") or "",
-                        api_request_id=getattr(agent, "_current_api_request_id", "")
-                        or "",
-                        enabled_tools=(
-                            list(agent.valid_tool_names)
-                            if agent.valid_tool_names
-                            else None
-                        ),
-                        skip_pre_tool_call_hook=True,
-                        skip_tool_request_middleware=True,
-                        skip_tool_execution_middleware=True,
-                        tool_request_middleware_trace=list(middleware_trace),
-                        enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                        disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                    )
+                    # Sequential path has no batch deadline; guard the raw
+                    # (post-approval) tool dispatch with the hard-timeout
+                    # backstop so a wedged tool cannot hang the turn. The
+                    # middleware around _execute — which owns approval/
+                    # interactive prompting — still runs on this thread; only
+                    # handle_function_call runs on the watchdog worker.
+                    def _call():
+                        return _ra().handle_function_call(
+                            function_name,
+                            next_args,
+                            effective_task_id,
+                            tool_call_id=tool_call.id,
+                            session_id=agent.session_id or "",
+                            turn_id=getattr(agent, "_current_turn_id", "") or "",
+                            api_request_id=getattr(agent, "_current_api_request_id", "")
+                            or "",
+                            enabled_tools=(
+                                list(agent.valid_tool_names)
+                                if agent.valid_tool_names
+                                else None
+                            ),
+                            skip_pre_tool_call_hook=True,
+                            skip_tool_request_middleware=True,
+                            skip_tool_execution_middleware=True,
+                            tool_request_middleware_trace=list(middleware_trace),
+                            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                        )
+
+                    return _invoke_with_watchdog(agent, function_name, _call)
 
                 (
                     function_result,

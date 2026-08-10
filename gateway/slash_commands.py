@@ -2444,6 +2444,116 @@ class GatewaySlashCommandsMixin:
 
         return await _finish_switch()
 
+    async def _handle_routing_command(self, event: MessageEvent) -> str:
+        """Handle /routing on the messaging surface.
+
+        Model routing is autonomous (re-evaluated each turn in the agent core).
+        The messaging gateway has no persistent live agent, so a manual choice is
+        applied as a per-session model override (the same mechanism as /model) and
+        takes effect on the next turn — it does NOT suppress auto-routing on
+        subsequent turns (use the TUI/desktop for a hard pin):
+
+            /routing [status]               — routing config + how selection works
+            /routing graph                  — list positions (tier / alias / model)
+            /routing <tier#|alias|key>      — switch this session to that tier's model
+            /routing swap <tier#|alias|key> — same, explicit
+            /routing up | down              — step one tier from the current selection
+            /routing auto | clear           — release the session's routing override
+        """
+        try:
+            from agent.routing.config import load_routing_config
+            config = load_routing_config()
+        except Exception as e:
+            return f"❌ routing unavailable: {e}"
+        if not config or not config.graph:
+            return "Model routing is not configured (no graph)."
+
+        try:
+            ordered = config.ordered_positions()
+        except Exception:
+            ordered = list(config.graph.keys())
+
+        def _fmt(key: str) -> str:
+            p = config.graph[key]
+            alias = getattr(p, "alias", "") or key
+            return (f"  [{getattr(p, 'tier', 0)}] {alias}: "
+                    f"{getattr(p, 'provider', '?')} / {getattr(p, 'model', '?')}")
+
+        args = event.get_command_args().strip()
+        parts = args.split() if args else []
+        sub = parts[0].lower() if parts else "status"
+        sub_arg = " ".join(parts[1:]) if len(parts) > 1 else ""
+
+        if sub in ("status", "graph"):
+            title = (
+                "🧭 Model routing — autonomous, re-evaluated each turn:"
+                if sub == "status" else "Routing positions (low → high):"
+            )
+            lines = [title] + [_fmt(k) for k in ordered]
+            if sub == "status":
+                lines.append(
+                    "Pick a tier for this session:  /routing <tier#|alias>"
+                    "   (release: /routing auto)"
+                )
+            return "\n".join(lines)
+
+        if sub in ("mode", "history", "oversight"):
+            return (
+                f"ℹ️ '/routing {sub}' isn't available on the messaging surface "
+                "(no live agent here). Use /routing <tier#|alias> to pick a tier, "
+                "or the TUI/desktop for live status and a hard pin."
+            )
+
+        # Session key — normalized exactly like a normal message turn / /model.
+        source = await asyncio.to_thread(
+            self._normalize_source_for_session_key, event.source
+        )
+        session_key = self._session_key_for_source(source)
+
+        if sub in ("auto", "clear", "none", "off"):
+            (self._session_model_overrides or {}).pop(session_key, None)
+            return "✓ Routing override released — model follows auto-routing / config default."
+
+        # Resolve the target position.
+        if sub in ("up", "down"):
+            ov = (self._session_model_overrides or {}).get(session_key) or {}
+            cur = None
+            for k in ordered:
+                p = config.graph[k]
+                if (getattr(p, "model", None) == ov.get("model")
+                        and getattr(p, "provider", None) == ov.get("provider")):
+                    cur = k
+                    break
+            if cur is None:
+                cur = ordered[0]
+            i = ordered.index(cur)
+            target = ordered[min(i + 1, len(ordered) - 1)] if sub == "up" else ordered[max(i - 1, 0)]
+        else:
+            sel = sub_arg if sub == "swap" else args
+            target = config.resolve_label(sel)
+
+        if not target:
+            avail = ", ".join(
+                f"{getattr(config.graph[k], 'tier', 0)}:{getattr(config.graph[k], 'alias', '') or k}"
+                for k in ordered
+            )
+            return f"❌ unknown route '{sub_arg or sub}'. Available — {avail}  (or up / down / auto)."
+
+        p = config.graph[target]
+        self._session_model_overrides[session_key] = {
+            "model": getattr(p, "model", None),
+            "provider": getattr(p, "provider", None),
+            "api_key": getattr(p, "api_key", None),
+            "base_url": getattr(p, "base_url", None),
+            "api_mode": getattr(p, "api_mode", None),
+        }
+        alias = getattr(p, "alias", "") or target
+        return (
+            f"✓ Routed to {alias} (tier {getattr(p, 'tier', 0)}, "
+            f"{getattr(p, 'model', '?')}) for this session — applies next turn. "
+            "'/routing auto' to release."
+        )
+
     async def _handle_codex_runtime_command(self, event: MessageEvent) -> str:
         """Handle /codex-runtime command in the gateway.
 

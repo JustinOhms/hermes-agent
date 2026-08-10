@@ -9610,6 +9610,125 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 return
             self._close_model_picker()
 
+    def _handle_routing_command(self, cmd_original: str):
+        """Handle /routing on the CLI chat surface.
+
+        The chat REPL keeps a persistent live agent, so a manual selection pins
+        against the autonomous per-turn router (like the TUI/desktop) until
+        ``/routing auto`` releases it:
+
+            /routing [status]            — routing status + positions
+            /routing graph               — positions (tier / alias / model)
+            /routing <tier#|alias|key>   — pin to that tier (switch model + pin)
+            /routing swap <sel>          — same, explicit
+            /routing up | down           — step one tier from the current position
+            /routing auto | clear        — release the pin, resume auto-routing
+        """
+        parts = cmd_original.split(None, 1)
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        sub, _, sub_arg = arg.partition(" ")
+        sub = sub.lower().strip()
+        sub_arg = sub_arg.strip()
+
+        try:
+            from agent.routing.config import load_routing_config
+            config = load_routing_config()
+        except Exception as e:
+            _cprint(f"  ✗ routing unavailable: {e}")
+            return
+        if not config or not config.graph:
+            _cprint("  Model routing is not configured (no graph).")
+            return
+
+        agent = getattr(self, "agent", None)
+        try:
+            ordered = config.ordered_positions()
+        except Exception:
+            ordered = list(config.graph.keys())
+
+        def _fmt(key):
+            p = config.graph[key]
+            alias = getattr(p, "alias", "") or key
+            return (f"  [{getattr(p, 'tier', 0)}] {alias}: "
+                    f"{getattr(p, 'provider', '?')} / {getattr(p, 'model', '?')}")
+
+        if sub in ("", "status", "graph"):
+            state = None
+            try:
+                from agent.routing.state import get_routing_state
+                state = get_routing_state(agent) if agent else None
+            except Exception:
+                state = None
+            cur = getattr(state, "current_position", None) if state else None
+            if sub == "graph":
+                _cprint("Routing positions (low → high):")
+            else:
+                icon = "⚡" if (state and getattr(state, "enabled", False)) else "🧭"
+                _cprint(f"{icon} Model routing (autonomous; re-evaluated each turn):")
+            for k in ordered:
+                _cprint(_fmt(k) + ("  ← current" if k == cur else ""))
+            if sub != "graph":
+                _cprint("  Pin a tier:  /routing <tier#|alias>   (release: /routing auto)")
+            return
+
+        if sub in ("auto", "clear", "none", "off"):
+            if agent is not None:
+                setattr(agent, "_routing_explicit_override", None)
+            _cprint("  ✓ Routing pin released — auto-routing resumed.")
+            return
+
+        # Resolve current position (for up/down + no-op detection).
+        current = None
+        swap_mgr = getattr(agent, "_routing_swap_manager", None) if agent else None
+        if swap_mgr is not None:
+            current = getattr(swap_mgr, "current_position", None)
+        if current is None and agent is not None:
+            cp, cm = getattr(agent, "provider", ""), getattr(agent, "model", "")
+            for k, p in config.graph.items():
+                if getattr(p, "provider", None) == cp and getattr(p, "model", None) == cm:
+                    current = k
+                    break
+
+        if sub in ("up", "down"):
+            target = config.position_above(current) if sub == "up" else config.position_below(current)
+            if target is None:
+                edge = "top" if sub == "up" else "base"
+                _cprint(f"  Already at the {edge} tier ({current or '?'}).")
+                return
+        else:
+            sel = sub_arg if sub == "swap" else arg
+            target = config.resolve_label(sel)
+            if target is None:
+                avail = ", ".join(
+                    f"{getattr(config.graph[k], 'tier', 0)}:{getattr(config.graph[k], 'alias', '') or k}"
+                    for k in ordered
+                )
+                _cprint(f"  ✗ unknown route '{sel}'. Available — {avail}  (or up / down / auto).")
+                return
+
+        pos = config.graph[target]
+        if target == current:
+            _cprint(f"  Already on {getattr(pos, 'alias', '') or target} (tier {getattr(pos, 'tier', 0)}).")
+            return
+        if not (agent and hasattr(agent, "switch_model")):
+            _cprint("  ✗ no active agent to route.")
+            return
+        agent.switch_model(
+            new_model=getattr(pos, "model", None),
+            new_provider=getattr(pos, "provider", None),
+            api_key=getattr(pos, "api_key", None),
+            base_url=getattr(pos, "base_url", None),
+            api_mode=getattr(pos, "api_mode", None),
+        )
+        if swap_mgr is not None and hasattr(swap_mgr, "set_current_position"):
+            swap_mgr.set_current_position(target)
+        setattr(agent, "_routing_explicit_override", target)
+        self.model = getattr(pos, "model", None) or self.model
+        self.provider = getattr(pos, "provider", None) or self.provider
+        label = getattr(pos, "alias", "") or target
+        _cprint(f"  ✓ Routed to {label} (tier {getattr(pos, 'tier', 0)}, "
+                f"{getattr(pos, 'model', '?')}) — pinned; '/routing auto' to release.")
+
     def _handle_model_switch(self, cmd_original: str):
         """Handle /model command — switch model.
 
@@ -10341,6 +10460,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_sessions_command(cmd_original)
         elif canonical == "model":
             self._handle_model_switch(cmd_original)
+        elif canonical == "routing":
+            self._handle_routing_command(cmd_original)
         elif canonical == "codex-runtime":
             self._handle_codex_runtime(cmd_original)
 

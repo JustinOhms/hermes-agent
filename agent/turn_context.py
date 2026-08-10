@@ -498,6 +498,31 @@ def build_turn_context(
     except Exception:
         pass
 
+    # ── Model routing (ADR-0040) ──
+    # Fire after the primary-runtime restore and before the pre_llm_call hook
+    # below, so a routed model swap is the one this turn actually uses. Wrapper
+    # keeps the core edit minimal; fully self-contained and non-fatal.
+    try:
+        from agent.routing import apply_turn_routing
+        apply_turn_routing(agent, user_message)
+    except Exception:
+        pass
+
+    # ── ask_upper tool registration (ADR-0040 §4) ──
+    # Re-evaluated EVERY turn and position-aware: apply_turn_routing() above may
+    # have swapped the active model to a lower- or upper-tier graph position, so
+    # the ask_upper schema must be added while a lower-tier model is active and
+    # stripped otherwise (upper models would be asking themselves). This runs in
+    # the per-turn prologue, before this turn's first API call assembles
+    # ``tools=`` from ``agent.tools`` — the same pre-request window the MCP
+    # refresh below uses — so the tool genuinely reaches the model. The helper
+    # is idempotent (add-or-remove by name) and non-fatal.
+    try:
+        from agent.routing.ask_upper import sync_ask_upper_registration
+        sync_ask_upper_registration(agent)
+    except Exception:
+        logger.debug("ask_upper registration skipped", exc_info=True)
+
     # Between-turns MCP refresh: an MCP server that finished connecting since
     # the previous turn (slow HTTP/OAuth servers routinely take 2-6s on a cold
     # connect, missing the bounded startup wait) lands in THIS turn's tool
@@ -590,6 +615,11 @@ def build_turn_context(
         agent._compression_warning = None  # send once
 
     # NOTE: _turns_since_memory and _iters_since_skill are NOT reset here.
+    # Refresh max_iterations from live config so mid-session config changes
+    # (e.g. user bumps agent.max_turns from 120 to 1000) take effect without
+    # requiring a /new or restart.  Only applies to TUI/CLI long-lived agents.
+    from agent.conversation_loop import _refresh_max_iterations
+    agent.max_iterations = _refresh_max_iterations(agent)
     agent.iteration_budget = IterationBudget(agent.max_iterations)
 
     # Log conversation turn start for debugging/observability.

@@ -172,8 +172,15 @@ export interface SessionInfo {
   project?: null | ProjectInfo
   reasoning_effort?: string
   release_date?: string
+  routing?: {
+    enabled: boolean
+    mode: string
+    position: string | null
+    swap_state: string
+  } | null
   service_tier?: string
   skills: Record<string, string[]>
+  slot?: string
   system_prompt?: string
   tools: Record<string, string[]>
   update_behind?: number | null
