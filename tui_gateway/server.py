@@ -5353,6 +5353,31 @@ def _session_info(agent, session: dict | None = None) -> dict:
     pending_switch = (session or {}).get("pending_model_switch") or {}
     pending_model = str(pending_switch.get("display_model") or "").strip()
     pending_provider = str(pending_switch.get("display_provider") or "").strip()
+    # ── Blue/green deployment slot detection ──
+    # Read the ~/.hermes/hermes-agent symlink to report which slot
+    # (blue/green) is live plus its checked-out branch. Pure UI, no token
+    # cost. This is unrelated to the session-concurrency "slot" claiming
+    # elsewhere in this module — it names the deployment target directory.
+    slot_name = ""
+    slot_branch = ""
+    try:
+        _hermes_home = os.path.expanduser("~/.hermes")
+        _link = os.path.join(_hermes_home, "hermes-agent")
+        if os.path.islink(_link):
+            _target = os.path.basename(os.readlink(_link))
+            slot_name = _target.replace("hermes-agent-", "")  # "blue"/"green"
+            _slot_dir = os.path.join(_hermes_home, _target)
+            _branch = subprocess.run(
+                ["git", "branch", "--show-current"],
+                cwd=_slot_dir,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if _branch.returncode == 0 and _branch.stdout.strip():
+                slot_branch = _branch.stdout.strip()
+    except Exception:
+        pass
     info: dict = {
         "model": pending_model or mirror.get("model", getattr(agent, "model", "")),
         "provider": pending_provider
@@ -5385,6 +5410,9 @@ def _session_info(agent, session: dict | None = None) -> dict:
         )
         if isinstance(session, dict) and session.get("profile_home")
         else _current_profile_name(),
+        "slot": f"{slot_name} · {slot_branch}"
+        if slot_name and slot_branch
+        else slot_name,
     }
     try:
         from hermes_cli import __version__, __release_date__
