@@ -2497,7 +2497,34 @@ class GatewaySlashCommandsMixin:
                 )
             return "\n".join(lines)
 
-        if sub in ("mode", "history", "oversight"):
+        if sub == "oversight":
+            # Config-level readout: the messaging surface has no persistent
+            # agent (so no live review history), but whether oversight is on,
+            # its interval, and the resolved review model are all knowable.
+            try:
+                from agent.routing.oversight import load_oversight_config
+                ovc = load_oversight_config()
+            except Exception as e:
+                return f"❌ oversight unavailable: {e}"
+            lines = ["🔍 Oversight (autonomous review):", f"  Enabled: {ovc.enabled}"]
+            if ovc.enabled:
+                lines.append(f"  Every: {ovc.every_n_turns} turns")
+                model, provider = ovc.model, ovc.provider
+                if not model or not provider:
+                    top = config.top_position()
+                    pos = config.graph.get(top) if top else None
+                    if pos is not None:
+                        model = model or getattr(pos, "model", "")
+                        provider = provider or getattr(pos, "provider", "")
+                lines.append(
+                    f"  Review model: {model} ({provider})"
+                    if (model and provider)
+                    else "  Review model: UNSET (reviews skipped)"
+                )
+            lines.append("  (live per-session review history: use the TUI/desktop)")
+            return "\n".join(lines)
+
+        if sub in ("mode", "history"):
             return (
                 f"ℹ️ '/routing {sub}' isn't available on the messaging surface "
                 "(no live agent here). Use /routing <tier#|alias> to pick a tier, "

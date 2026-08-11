@@ -179,6 +179,23 @@ def apply_turn_routing(agent: object, user_message: str) -> Optional[RoutingDeci
     Returns the RoutingDecision (for callers/tests), or None when routing is
     disabled or errored.
     """
+    # ── Oversight escalation (Phase 3 · ADR-0040 §3) ──
+    # If the previous turn's oversight review returned ESCALATE, force THIS turn
+    # onto the top-tier model, once. Cleared immediately so normal per-turn
+    # routing resumes next turn. Non-fatal.
+    if getattr(agent, "_oversight_escalation_pending", False):
+        try:
+            agent._oversight_escalation_pending = False
+        except Exception:
+            pass
+        try:
+            if _escalate_to_top_tier(agent):
+                return None
+        except Exception:
+            logger.debug(
+                "oversight escalation override failed (non-fatal)", exc_info=True
+            )
+
     decision = get_routing_decision(agent, user_message)
     if decision is None:
         return None
@@ -219,6 +236,43 @@ def apply_turn_routing(agent: object, user_message: str) -> Optional[RoutingDeci
 
 
 # ── Internal helpers ────────────────────────────────────────────────────────
+
+
+def _escalate_to_top_tier(agent: object) -> bool:
+    """Force ``agent`` onto the routing graph's top tier for THIS turn.
+
+    Drives the oversight ESCALATE path (ADR-0040 §3). Returns True when the
+    agent is on the top tier afterwards (switched, or already there), False when
+    routing is disabled or the graph is unusable (caller falls back to normal
+    per-turn routing).
+    """
+    from agent.routing.config import load_routing_config
+
+    config = load_routing_config()
+    if not config.enabled:
+        return False
+    top = config.top_position()
+    pos = config.graph.get(top) if top else None
+    if not pos:
+        return False
+    if pos.provider == getattr(agent, "provider", None) and pos.model == getattr(
+        agent, "model", None
+    ):
+        return True  # already on the top tier
+    from agent.agent_runtime_helpers import switch_model as _switch_model
+
+    _switch_model(
+        agent,
+        new_model=pos.model,
+        new_provider=pos.provider,
+        api_key=pos.api_key,
+        base_url=pos.base_url,
+        api_mode=pos.api_mode,
+    )
+    logger.info(
+        "oversight_escalation: forced top tier %s (%s)", pos.model, pos.provider
+    )
+    return True
 
 
 def _get_or_create_detector(agent: object, config: RoutingConfig) -> InteractionModeDetector:

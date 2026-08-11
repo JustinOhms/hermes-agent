@@ -94,7 +94,13 @@ def load_oversight_config(cfg: Optional[Dict[str, Any]] = None) -> OversightConf
         provider=str(oversight_raw.get("provider", "")),
         base_url=str(oversight_raw.get("base_url", "")),
         api_key=str(oversight_raw.get("api_key", "")),
-        every_n_turns=int(oversight_raw.get("every_n_turns", 10)),
+        every_n_turns=int(
+            oversight_raw.get(
+                "every_n_turns",
+                # Back-compat alias: hand-written configs use review_interval_turns.
+                oversight_raw.get("review_interval_turns", 10),
+            )
+        ),
         review_window=int(oversight_raw.get("review_window", 10)),
         review_window_ctx_fraction=float(
             oversight_raw.get("review_window_ctx_fraction", 0.6)
@@ -456,6 +462,35 @@ def get_or_create_oversight_reviewer(agent: object) -> Optional[OversightReviewe
 
     config = load_oversight_config()
     if not config.enabled:
+        return None
+
+    # The reviewer needs an upper model to call. When the oversight config names
+    # none explicitly, borrow the routing graph's top tier (the natural "upper"
+    # model, e.g. gamma) so oversight works out of the box on a routed setup
+    # instead of silently no-opping against an empty model (ADR-0040 §3).
+    if not config.model or not config.provider:
+        try:
+            from agent.routing.config import load_routing_config
+
+            rcfg = load_routing_config()
+            top = rcfg.top_position() if (rcfg and rcfg.enabled) else None
+            pos = rcfg.graph.get(top) if top else None
+            if pos is not None:
+                config.model = config.model or pos.model
+                config.provider = config.provider or pos.provider
+                config.base_url = config.base_url or pos.base_url
+                config.api_key = config.api_key or pos.api_key
+        except Exception:
+            logger.debug(
+                "oversight: could not derive review model from routing graph",
+                exc_info=True,
+            )
+
+    if not config.model or not config.provider:
+        logger.warning(
+            "oversight: enabled but no review model is configured and none could "
+            "be derived from the routing graph — reviews will be skipped"
+        )
         return None
 
     reviewer = OversightReviewer(config)

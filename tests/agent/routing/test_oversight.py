@@ -547,3 +547,129 @@ class TestOversightStatus:
         assert len(status["history"]) == 2
         assert status["history"][0]["action"] == "approve"
         assert status["history"][1]["action"] == "correct"
+
+
+# ---------------------------------------------------------------------------
+# Config-schema back-compat
+# ---------------------------------------------------------------------------
+
+class TestOversightConfigAlias:
+    def test_review_interval_turns_alias(self):
+        cfg = load_oversight_config(
+            {"model": {"routing": {"oversight": {
+                "enabled": True, "review_interval_turns": 7}}}}
+        )
+        assert cfg.every_n_turns == 7
+
+    def test_every_n_turns_wins_over_alias(self):
+        cfg = load_oversight_config(
+            {"model": {"routing": {"oversight": {
+                "enabled": True, "every_n_turns": 9, "review_interval_turns": 7}}}}
+        )
+        assert cfg.every_n_turns == 9
+
+
+# ---------------------------------------------------------------------------
+# Review-model derivation from the routing graph
+# ---------------------------------------------------------------------------
+
+class _FakePos:
+    def __init__(self, provider, model, base_url="", api_key="", api_mode=""):
+        self.provider = provider
+        self.model = model
+        self.base_url = base_url
+        self.api_key = api_key
+        self.api_mode = api_mode
+
+
+class _FakeRoutingConfig:
+    def __init__(self, enabled=True):
+        self.enabled = enabled
+        self.graph = {
+            "alpha": _FakePos("local", "qwen", api_mode="chat_completions"),
+            "gamma": _FakePos("openai-codex", "gpt-5.6-sol", base_url="https://x/codex"),
+        }
+
+    def top_position(self):
+        return "gamma"
+
+
+class TestOversightModelDerivation:
+    def test_reviewer_borrows_top_tier_when_model_unset(self):
+        agent = MagicMock()
+        agent._oversight_reviewer = None
+        with patch("agent.routing.oversight.load_oversight_config",
+                   return_value=OversightConfig(enabled=True, model="", provider="")), \
+             patch("agent.routing.config.load_routing_config",
+                   return_value=_FakeRoutingConfig()):
+            reviewer = get_or_create_oversight_reviewer(agent)
+        assert reviewer is not None
+        assert reviewer.config.model == "gpt-5.6-sol"
+        assert reviewer.config.provider == "openai-codex"
+
+    def test_reviewer_none_when_no_model_derivable(self):
+        agent = MagicMock()
+        agent._oversight_reviewer = None
+        with patch("agent.routing.oversight.load_oversight_config",
+                   return_value=OversightConfig(enabled=True, model="", provider="")), \
+             patch("agent.routing.config.load_routing_config",
+                   return_value=_FakeRoutingConfig(enabled=False)):
+            reviewer = get_or_create_oversight_reviewer(agent)
+        assert reviewer is None
+
+
+# ---------------------------------------------------------------------------
+# ESCALATE consumer
+# ---------------------------------------------------------------------------
+
+class TestEscalateToTopTier:
+    def test_forces_switch_to_top(self):
+        from agent.routing import _escalate_to_top_tier
+        agent = MagicMock()
+        agent.provider = "local"
+        agent.model = "qwen"
+        with patch("agent.routing.config.load_routing_config",
+                   return_value=_FakeRoutingConfig()), \
+             patch("agent.agent_runtime_helpers.switch_model") as mock_switch:
+            assert _escalate_to_top_tier(agent) is True
+        mock_switch.assert_called_once()
+        assert mock_switch.call_args.kwargs["new_model"] == "gpt-5.6-sol"
+        assert mock_switch.call_args.kwargs["new_provider"] == "openai-codex"
+
+    def test_noop_when_already_on_top(self):
+        from agent.routing import _escalate_to_top_tier
+        agent = MagicMock()
+        agent.provider = "openai-codex"
+        agent.model = "gpt-5.6-sol"
+        with patch("agent.routing.config.load_routing_config",
+                   return_value=_FakeRoutingConfig()), \
+             patch("agent.agent_runtime_helpers.switch_model") as mock_switch:
+            assert _escalate_to_top_tier(agent) is True
+        mock_switch.assert_not_called()
+
+    def test_false_when_routing_disabled(self):
+        from agent.routing import _escalate_to_top_tier
+        agent = MagicMock()
+        with patch("agent.routing.config.load_routing_config",
+                   return_value=_FakeRoutingConfig(enabled=False)):
+            assert _escalate_to_top_tier(agent) is False
+
+
+# ---------------------------------------------------------------------------
+# Integration-wiring guards — the module can be perfect while the call site is
+# missing. The oversight hook was dropped in a resync twice; these fail loudly
+# if it happens again (cheap source-level assertions, no heavy loop setup).
+# ---------------------------------------------------------------------------
+
+class TestOversightWiring:
+    def test_finalize_turn_invokes_oversight(self):
+        import inspect
+        import agent.turn_finalizer as tf
+        assert "run_oversight_if_due" in inspect.getsource(tf.finalize_turn)
+
+    def test_apply_turn_routing_consumes_escalation(self):
+        import inspect
+        from agent.routing import apply_turn_routing
+        src = inspect.getsource(apply_turn_routing)
+        assert "_oversight_escalation_pending" in src
+        assert "_escalate_to_top_tier" in src
