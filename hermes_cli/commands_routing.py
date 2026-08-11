@@ -81,5 +81,45 @@ def cmd_routing_history(config: Dict[str, Any]) -> None:
 
 
 def cmd_routing_oversight(config: Dict[str, Any]) -> None:
-    """Show oversight decisions."""
-    print("Oversight decisions:")
+    """Show oversight configuration + the resolved upper review model.
+
+    The one-shot CLI has no live session, so per-session review history isn't
+    available here — use ``/routing oversight`` inside a TUI/desktop session for
+    live decisions. This shows whether oversight is enabled, its interval, and
+    which model would perform reviews.
+    """
+    try:
+        from agent.routing.oversight import load_oversight_config
+        ovc = load_oversight_config(config)
+    except Exception as e:
+        print(f"Oversight unavailable: {e}")
+        return
+
+    print("Oversight:")
+    print(f"  Enabled: {ovc.enabled}")
+    if not ovc.enabled:
+        print("  (set model.routing.oversight.enabled: true to activate)")
+        return
+    print(f"  Every: {ovc.every_n_turns} turns")
+    print(f"  Max reviews/session: {ovc.max_reviews_per_session}")
+
+    model, provider = ovc.model, ovc.provider
+    if not model or not provider:
+        try:
+            from agent.routing.config import load_routing_config
+            rcfg = load_routing_config(config)
+            top = rcfg.top_position() if rcfg else None
+            pos = rcfg.graph.get(top) if (rcfg and top) else None
+            if pos is not None:
+                model = model or pos.model
+                provider = provider or pos.provider
+        except Exception:
+            pass
+    if model and provider:
+        print(f"  Review model: {model} ({provider})")
+    else:
+        print(
+            "  Review model: UNSET — configure model.routing.oversight.model "
+            "or a routing graph top tier (reviews will be skipped)"
+        )
+    print("  (live per-session decisions: use /routing oversight in a session)")
