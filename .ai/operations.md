@@ -53,6 +53,38 @@ branch:
   from its ADR + `archive/*` source against *current* upstream (see the
   `hermes-upgrade` skill).
 
+## Authoring a new feature (or fix) — the reapply loop
+
+Every fork change MUST end up as a registered living patch, or the next upstream
+resync silently drops it (the deploy branches are rebuilt from the patch branches,
+so anything only on `main-blue`/`main-green` is an orphan). When you build
+something new, do all of these — not just the code:
+
+1. **Branch off current `main`** (the upstream mirror), one concern per branch:
+   `git checkout -b feat/<name> main` (or `fixes/<name>`).
+2. **Build it**, and for anything wired into the core loop add **wiring-guard
+   tests** — assert the integration hook is actually *reached*, not just that the
+   module imports (e.g. `assert "my_hook" in inspect.getsource(the_caller)`). A
+   unit-tested module whose call site went missing is the exact way a patch dies
+   unnoticed on a resync.
+3. **Verify the hooks land**: imports succeed AND the hook is invoked; run the
+   feature's tests. Commit to the branch.
+4. **Register it in `~/.hermes/active-patches.yaml`** — a `patches:` entry with
+   `name`, `status`, `source: feat/<name>`, `adrs`, `commits:` (the SHAs,
+   oldest-first) and `notes:` describing what it wires/restores well enough for a
+   future re-derivation to reproduce it from intent.
+5. **Push the branch to `origin`** (`git push origin feat/<name>`) so the commit
+   is durable, not just local — a manifest SHA that only exists locally breaks the
+   consolidation cherry-pick if the working copy is ever reset or re-cloned.
+6. **Deploy via `hermes-update`** (below). Never leave the change as a one-off
+   commit on a deploy branch.
+
+**The gate that enforces this:** `hermes-manifest-check` runs at `hermes-upgrade`
+preflight (fail-closed) — it flags any `feat/*`/`fixes/*` branch missing from the
+manifest and any manifest SHA that is dangling or unpushed, so a forgotten
+feature is caught *before* a resync would drop it. Run it yourself anytime with
+`hermes-manifest-check`.
+
 ## Deploying (the only supported path)
 
 Never run bare `hermes update` (it does an in-place `git pull` and destroys the
@@ -75,22 +107,24 @@ features/guards; upstream-flaky dirs are advisory vs a recorded baseline) ·
 6 live-verify (boots the idle slot, imports `agent.routing` etc.) · 7 re-lock ·
 8 swap · 9 log to `deploy-log.md`.
 
-## The swap gotcha (do not skip the plist regen)
+## The swap (slot-agnostic plist)
 
-A bare `hermes gateway restart` only kickstarts the *existing* launchd plist,
-which hardcodes the resolved **old-slot** python path — it does NOT re-point the
-gateway at the new slot. A swap must regenerate the plist. Manual swap / rollback:
+The launchd plist references the `~/.hermes/hermes-agent` **symlink**, not a
+resolved slot path, so a swap is just a symlink flip — **no plist regen**. Manual
+swap / rollback:
 
 ```bash
-hermes-slot green                              # or blue — flip the symlink
-hermes gateway stop
-hermes gateway install --force --no-start-now  # REGENERATE the plist for the new slot
-hermes gateway start
-hermes gateway status                          # confirm the live PID runs from the new slot
+hermes-slot green      # or blue — flip the symlink to the target slot
+launchctl kickstart -k gui/$(id -u)/ai.hermes.gateway   # restart in place (SKIP if the gateway is disabled)
+hermes-health          # confirm the live PID runs from the new slot
 ```
 
-Always confirm the running gateway PID's interpreter is under the newly-active
-slot (`ps -p <pid> -o command=`), not the old one.
+⚠ **Do NOT run `hermes gateway install --force`** to "fix" a swap — it re-stamps
+the *resolved* old-slot python path into the plist and reintroduces the
+wrong-slot bug this design removed. If that ever happens, restore the
+slot-agnostic plist with `rescue/hermes-gateway-symlink-plist`. Always confirm
+the running gateway PID's interpreter is under the newly-active slot
+(`ps -p <pid> -o command=`), not the old one.
 
 ## Recovery
 
@@ -105,6 +139,10 @@ slot (`ps -p <pid> -o command=`), not the old one.
 2. Two human gates — pause before (a) pushing to the fork and (b) the live swap.
 3. `hermes-update` only (never bare `hermes update`); dry-run, then `--no-swap`,
    then `--apply`.
-4. Regenerate the plist on every swap; verify the live PID is on the new slot.
+4. The plist is slot-agnostic (points at the `hermes-agent` symlink): a swap is
+   `hermes-slot` + `launchctl kickstart` — **never** `hermes gateway install
+   --force`. Verify the live PID is on the new slot.
 5. Keep `main` a pure upstream mirror; carry fork changes as `feat/*`/`fixes/*`
-   living patches registered in `active-patches.yaml`.
+   living patches registered in `active-patches.yaml`. **Every** new feature
+   follows the authoring checklist below — unregistered work is silently dropped
+   on the next resync.
