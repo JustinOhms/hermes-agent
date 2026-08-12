@@ -203,6 +203,7 @@ class AskUpperTool:
             from agent.auxiliary_client import call_llm
 
             response = call_llm(
+                task="ask_upper",
                 provider=self.upper_provider,
                 model=self.upper_model,
                 base_url=self.upper_base_url or "",

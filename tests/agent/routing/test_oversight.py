@@ -673,3 +673,100 @@ class TestOversightWiring:
         src = inspect.getsource(apply_turn_routing)
         assert "_oversight_escalation_pending" in src
         assert "_escalate_to_top_tier" in src
+
+    def test_run_oversight_if_due_persists_ledger(self):
+        import inspect
+        from agent.routing.oversight import run_oversight_if_due
+        assert "persist_oversight_ledger" in inspect.getsource(run_oversight_if_due)
+
+
+# ---------------------------------------------------------------------------
+# Metrics: per-review duration/cost, session summary, durable ledger
+# ---------------------------------------------------------------------------
+
+class _FakeSessionDB:
+    def __init__(self):
+        self._meta = {}
+
+    def set_meta(self, key, value, **kw):
+        self._meta[key] = value
+
+    def get_meta(self, key):
+        return self._meta.get(key)
+
+
+class TestOversightMetrics:
+    @patch("agent.auxiliary_client.call_llm")
+    def test_review_labels_task_and_records_duration_cost(
+        self, mock_call_llm, reviewer, sample_messages
+    ):
+        mock_call_llm.return_value = _make_approve_response()
+        result = reviewer.review(sample_messages, "qwen", 5)
+        # task label → aux accounting books it into session_model_usage
+        assert mock_call_llm.call_args.kwargs.get("task") == "oversight"
+        assert result.duration_ms >= 0
+        assert hasattr(result, "est_cost_usd")  # priced or None, but present
+
+    def test_summarize_verdict_mix_duration_and_pct(self, reviewer):
+        reviewer.reviews.append(
+            OversightResult(action=OversightAction.APPROVE, duration_ms=100)
+        )
+        reviewer.reviews.append(
+            OversightResult(action=OversightAction.CORRECT, duration_ms=200, est_cost_usd=0.01)
+        )
+        reviewer.reviews.append(
+            OversightResult(action=OversightAction.APPROVE, duration_ms=300)
+        )
+        s = reviewer.summarize(turns=6)
+        assert s["reviews"] == 3
+        assert s["actions"]["approve"] == 2 and s["actions"]["correct"] == 1
+        assert s["total_duration_ms"] == 600 and s["avg_duration_ms"] == 200
+        assert s["est_cost_usd"] == 0.01
+        assert s["pct_of_turns"] == 50.0
+        assert len(s["recent"]) == 3
+
+    def test_ledger_persist_and_load_via_accounting_context(self, reviewer):
+        from agent.aux_accounting import (
+            set_accounting_context,
+            reset_accounting_context,
+        )
+        from agent.routing.oversight import (
+            persist_oversight_ledger,
+            load_oversight_ledger,
+        )
+        db = _FakeSessionDB()
+        reviewer.reviews.append(
+            OversightResult(action=OversightAction.CORRECT, duration_ms=150)
+        )
+        tok = set_accounting_context(db, "sess-123")
+        try:
+            persist_oversight_ledger(reviewer, turn_count=5)
+        finally:
+            reset_accounting_context(tok)
+        loaded = load_oversight_ledger(db, "sess-123")
+        assert loaded is not None
+        assert loaded["reviews"] == 1
+        assert loaded["actions"]["correct"] == 1
+        assert loaded["turns"] == 5
+
+    def test_ledger_persist_is_noop_without_context(self, reviewer):
+        from agent.routing.oversight import persist_oversight_ledger
+        reviewer.reviews.append(OversightResult(action=OversightAction.APPROVE))
+        persist_oversight_ledger(reviewer, turn_count=5)  # must not raise
+
+    def test_load_ledger_missing_returns_none(self):
+        from agent.routing.oversight import load_oversight_ledger
+        assert load_oversight_ledger(_FakeSessionDB(), "nope") is None
+
+
+class TestAskUpperMetrics:
+    @patch("agent.auxiliary_client.call_llm")
+    def test_ask_upper_labels_task(self, mock_call_llm):
+        from agent.routing.ask_upper import AskUpperTool
+        resp = MagicMock()
+        resp.choices = [MagicMock()]
+        resp.choices[0].message.content = "guidance"
+        resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
+        mock_call_llm.return_value = resp
+        AskUpperTool(upper_provider="p", upper_model="m").execute("verify", "ok?")
+        assert mock_call_llm.call_args.kwargs.get("task") == "ask_upper"

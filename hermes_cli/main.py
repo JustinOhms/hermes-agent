@@ -11438,7 +11438,8 @@ def main():
     routing_mode = routing_subparsers.add_parser("mode", help="Override mode detection")
     routing_mode.add_argument("mode", choices=["interactive", "autonomous", "auto"], help="Mode to set")
     routing_history = routing_subparsers.add_parser("history", help="Last 10 routing decisions with timestamps")
-    routing_oversight = routing_subparsers.add_parser("oversight", help="Show oversight decisions")
+    routing_oversight = routing_subparsers.add_parser("oversight", help="Show oversight config, or a session's metrics ledger with --session")
+    routing_oversight.add_argument("--session", dest="session", default=None, help="Session id to report the durable oversight ledger for (count, verdict mix, duration, cost, %% of turns)")
     routing_parser.set_defaults(func=cmd_routing)
 
     # =========================================================================
