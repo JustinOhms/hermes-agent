@@ -13150,21 +13150,40 @@ def _handle_routing_command(sid: str, session: dict, agent, arg: str) -> str:
                 "🔍 Oversight: disabled — set model.routing.oversight.enabled=true "
                 "and configure a review model (or a routing graph top tier)."
             )
-        status = reviewer.get_status()
+        _turns = int(getattr(agent, "_user_turn_count", 0) or 0)
+        status = reviewer.get_status(turns=_turns or None)
         lines = ["🔍 Oversight status:"]
         _budget = "  (budget exhausted)" if status["budget_exhausted"] else ""
+        _pct = (
+            f" — {status['pct_of_turns']}% of {_turns} turns"
+            if status.get("pct_of_turns") is not None
+            else ""
+        )
         lines.append(
-            f"  Reviews: {status['reviews_completed']}/{status['max_reviews']}{_budget}"
+            f"  Reviews: {status['reviews_completed']}/{status['max_reviews']}{_budget}{_pct}"
         )
         lines.append(f"  Every: {status['every_n_turns']} turns")
+        if status["reviews_completed"]:
+            _acts = status.get("actions") or {}
+            _mix = "  ".join(f"{k}={v}" for k, v in _acts.items() if v)
+            lines.append(f"  Verdicts: {_mix or 'none'}")  # the 'is it working?' signal
+            lines.append(
+                f"  Duration: {status['total_duration_ms']}ms total, "
+                f"{status['avg_duration_ms']}ms avg"
+            )
+            lines.append(
+                f"  Tokens: {status['input_tokens']}+{status['output_tokens']}"
+                f"   Est cost: ${(status.get('est_cost_usd') or 0.0):.4f}"
+            )
         if status["last_action"]:
             lines.append(f"  Last action: {status['last_action']}")
         if status["history"]:
             lines.append("  Recent:")
             for h in status["history"]:
                 ts_str = _time.strftime("%H:%M:%S", _time.localtime(h["timestamp"]))
+                _dur = f" ({h['duration_ms']}ms)" if h.get("duration_ms") else ""
                 note = f" — {h['note']}" if h["note"] else ""
-                lines.append(f"    [{ts_str}] {h['action']}{note}")
+                lines.append(f"    [{ts_str}] {h['action']}{_dur}{note}")
         return "\n".join(lines)
 
     else:

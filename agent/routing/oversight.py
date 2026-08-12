@@ -46,6 +46,9 @@ class OversightResult:
     window_size: int = 0  # How many turns were reviewed
     input_tokens: int = 0
     output_tokens: int = 0
+    duration_ms: int = 0          # wall-clock of the review call (metrics)
+    est_cost_usd: Optional[float] = None  # estimated $ of the review call
+    turn_count: int = 0           # session turn the review ran at
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +281,9 @@ class OversightReviewer:
         try:
             from agent.auxiliary_client import call_llm
 
+            _t0 = time.time()
             response = call_llm(
+                task="oversight",
                 provider=self.config.provider,
                 model=self.config.model,
                 base_url=self.config.base_url or "",
@@ -299,6 +304,8 @@ class OversightReviewer:
             elif hasattr(response, "content"):
                 content = response.content or ""
 
+            duration_ms = int((time.time() - _t0) * 1000)
+
             # Track tokens
             input_tokens = 0
             output_tokens = 0
@@ -307,11 +314,21 @@ class OversightReviewer:
                 input_tokens = getattr(usage, "prompt_tokens", 0) or 0
                 output_tokens = getattr(usage, "completion_tokens", 0) or 0
 
+            # Estimate the review's cost for the metrics ledger (mirrors the aux
+            # accounting recorder; the task="oversight" label above also books it
+            # into session_model_usage for the usage dashboards).
+            est_cost = _estimate_review_cost(
+                usage, self.config.model, self.config.provider,
+                self.config.base_url or "",
+            )
+
             # Parse the action
             result = self._parse_response(content)
             result.window_size = window_size
             result.input_tokens = input_tokens
             result.output_tokens = output_tokens
+            result.duration_ms = duration_ms
+            result.est_cost_usd = est_cost
 
             self.reviews.append(result)
 
@@ -333,6 +350,7 @@ class OversightReviewer:
                 action=OversightAction.APPROVE,
                 note=f"[Review failed: {exc}]",
                 window_size=window_size,
+                duration_ms=int((time.time() - _t0) * 1000),
             )
             self.reviews.append(result)
             return result
@@ -426,9 +444,48 @@ class OversightReviewer:
             warning=str(data.get("warning", "")),
         )
 
-    def get_status(self) -> Dict[str, Any]:
+    def summarize(self, turns: Optional[int] = None) -> Dict[str, Any]:
+        """Aggregate this session's reviews into a metrics summary.
+
+        Shared by the live ``/routing oversight`` display and the durable
+        per-session ledger, so both answer "was oversight used + working?":
+        invocation count, the verdict mix (the working signal), duration, tokens,
+        estimated cost, and — when ``turns`` is given — % of turns reviewed.
+        """
+        reviews = self.reviews
+        actions = {a.value: 0 for a in OversightAction}
+        for r in reviews:
+            actions[r.action.value] = actions.get(r.action.value, 0) + 1
+        total_dur = sum(r.duration_ms for r in reviews)
+        return {
+            "reviews": len(reviews),
+            "actions": actions,
+            "total_duration_ms": total_dur,
+            "avg_duration_ms": int(total_dur / len(reviews)) if reviews else 0,
+            "input_tokens": sum(r.input_tokens for r in reviews),
+            "output_tokens": sum(r.output_tokens for r in reviews),
+            "est_cost_usd": round(sum((r.est_cost_usd or 0.0) for r in reviews), 6),
+            "turns": turns,
+            "pct_of_turns": (
+                round(100.0 * len(reviews) / turns, 1) if turns else None
+            ),
+            "first_ts": reviews[0].timestamp if reviews else None,
+            "last_ts": reviews[-1].timestamp if reviews else None,
+            "recent": [
+                {
+                    "turn": r.turn_count,
+                    "ts": r.timestamp,
+                    "action": r.action.value,
+                    "duration_ms": r.duration_ms,
+                }
+                for r in reviews[-20:]
+            ],
+        }
+
+    def get_status(self, turns: Optional[int] = None) -> Dict[str, Any]:
         """Return current oversight status for /routing display."""
         last_review = self.reviews[-1] if self.reviews else None
+        summary = self.summarize(turns=turns)
         return {
             "enabled": self.config.enabled,
             "reviews_completed": self.review_count,
@@ -437,11 +494,20 @@ class OversightReviewer:
             "every_n_turns": self.config.every_n_turns,
             "last_action": last_review.action.value if last_review else None,
             "last_timestamp": last_review.timestamp if last_review else None,
+            # Metrics (see summarize): verdict mix, duration, cost, %-of-turns.
+            "actions": summary["actions"],
+            "total_duration_ms": summary["total_duration_ms"],
+            "avg_duration_ms": summary["avg_duration_ms"],
+            "input_tokens": summary["input_tokens"],
+            "output_tokens": summary["output_tokens"],
+            "est_cost_usd": summary["est_cost_usd"],
+            "pct_of_turns": summary["pct_of_turns"],
             "history": [
                 {
                     "action": r.action.value,
                     "timestamp": r.timestamp,
                     "window_size": r.window_size,
+                    "duration_ms": r.duration_ms,
                     "note": r.note[:100] if r.note else "",
                 }
                 for r in self.reviews[-5:]  # Last 5 reviews
@@ -536,6 +602,11 @@ def run_oversight_if_due(
 
     # Execute the review
     result = reviewer.review(review_messages, primary_model, turn_count)
+    result.turn_count = turn_count
+
+    # Persist the durable per-session metrics ledger so a past session can be
+    # inspected ("was oversight used + working?"). Best-effort, non-fatal.
+    persist_oversight_ledger(reviewer, turn_count)
 
     # Clear escalation flag
     try:
@@ -544,6 +615,69 @@ def run_oversight_if_due(
         pass
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Metrics: per-review cost + durable per-session ledger (state_meta KV)
+# ---------------------------------------------------------------------------
+
+_LEDGER_KEY_PREFIX = "oversight:"
+
+
+def _ledger_key(session_id: str) -> str:
+    return f"{_LEDGER_KEY_PREFIX}{session_id}"
+
+
+def _estimate_review_cost(
+    usage: Any, model: str, provider: str, base_url: str
+) -> Optional[float]:
+    """Estimate a review call's USD cost from its usage (best-effort, mirrors
+    the aux-accounting recorder). Returns None when it cannot be priced."""
+    if usage is None:
+        return None
+    try:
+        from agent.usage_pricing import estimate_usage_cost, normalize_usage
+
+        norm = normalize_usage(usage, provider=provider)
+        cost = estimate_usage_cost(model, norm, provider=provider, base_url=base_url)
+        return float(cost.amount_usd) if cost.amount_usd is not None else None
+    except Exception:
+        logger.debug("oversight: review cost estimate failed", exc_info=True)
+        return None
+
+
+def persist_oversight_ledger(reviewer: "OversightReviewer", turn_count: int) -> None:
+    """Write the session's oversight summary to the session DB (best-effort).
+
+    Reuses the ambient aux-accounting context (session_db, session_id) — the same
+    handles the aux cost recorder uses, live during ``finalize_turn`` — and stores
+    a JSON summary in the ``state_meta`` KV under ``oversight:<session_id>``. No
+    schema change (fork-resync-safe). Never raises.
+    """
+    try:
+        from agent.aux_accounting import get_accounting_context
+
+        ctx = get_accounting_context()
+        if not ctx:
+            return
+        session_db, session_id = ctx
+        if session_db is None or not session_id:
+            return
+        summary = reviewer.summarize(turns=turn_count)
+        session_db.set_meta(_ledger_key(session_id), json.dumps(summary))
+    except Exception:
+        logger.debug("oversight ledger persist failed (non-fatal)", exc_info=True)
+
+
+def load_oversight_ledger(
+    session_db: Any, session_id: str
+) -> Optional[Dict[str, Any]]:
+    """Read the persisted oversight summary for a session, or None if absent."""
+    try:
+        raw = session_db.get_meta(_ledger_key(session_id))
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
 
 
 def build_oversight_injection(result: OversightResult, oversight_model: str) -> Dict[str, str]:
