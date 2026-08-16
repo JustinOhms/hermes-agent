@@ -379,6 +379,12 @@ VALID_HOOKS: Set[str] = {
     #   alias_used: the exact token the user typed (str), args_raw: str,
     #   session_key: str | None (gateway), platform: str | None (gateway).
     "pre_command",
+    # Failover decision hook. Fired inside the retry loop just before the
+    # fallback chain is activated. Plugins can redirect, retry, or abort.
+    # Return values: {"action": "redirect", "model": "...", "provider": "..."}
+    #                {"action": "retry"} (suppress fallback, retry same provider)
+    #                {"action": "abort", "message": "..."} (stop retry loop)
+    "pre_failover_decision",
 }
 
 # Hooks whose return value carries a directive that the shell-hook response

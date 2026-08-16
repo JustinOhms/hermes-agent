@@ -6942,6 +6942,46 @@ class AIAgent:
         from agent.chat_completion_helpers import try_activate_fallback
         return try_activate_fallback(self, reason)
 
+    def _invoke_pre_failover_decision(
+        self,
+        current_model: str,
+        current_provider: str,
+        current_rankings: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Invoke the pre_failover_decision hook.
+
+        This hook fires inside the retry loop just before the fallback chain
+        is activated. It gives plugins the ability to intercept and redirect
+        failover decisions rather than being limited to observe-only behavior.
+
+        Hook actions:
+          - redirect: switch to a specific model/provider (via switch_model)
+          - retry: suppress fallback, retry same provider
+          - abort: stop retry loop, return message to user
+          - continue/None: no-op, proceed with normal fallback chain
+
+        Args:
+            current_model: The model currently being tried
+            current_provider: The provider currently being tried
+            current_rankings: Current model rankings (optional, from routing)
+
+        Returns:
+            Optional dict with "action" key, or None to proceed normally
+        """
+        from hermes_cli.plugins import invoke_hook
+
+        # ``invoke_hook`` returns a list of non-None results from every
+        # registered callback; the failover decision is single-valued, so
+        # honor the first responder (or None when no plugin intercepts).
+        results = invoke_hook(
+            "pre_failover_decision",
+            agent=self,
+            current_model=current_model,
+            current_provider=current_provider,
+            current_rankings=current_rankings or [],
+        )
+        return results[0] if results else None
+
     def _has_pending_fallback(self) -> bool:
         """Whether a fallback provider is actually available to switch to.
 
