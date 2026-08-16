@@ -2760,6 +2760,10 @@ def init_agent(
         working_dir=os.getenv("TERMINAL_CWD") or None,
     )
     agent._user_turn_count = 0
+    # Routing oversight (ADR-0040 §3): set when a periodic review returns
+    # ESCALATE, consumed by apply_turn_routing to force the next turn onto the
+    # top tier. getattr-guarded everywhere, so this init is for clarity/parity.
+    agent._oversight_escalation_pending = False
     # Copilot x-initiator flag: first API call of a user turn sends "user" (#3040).
     agent._is_user_initiated_turn = False
 

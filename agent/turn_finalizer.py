@@ -355,6 +355,53 @@ def finalize_turn(
                 # filled row is re-examined instead of skipped.
                 agent._db_flush_scan_prefix = None
 
+        # ── Periodic Oversight (Phase 3 · ADR-0040 §3) ────────────
+        # Now that the turn's answer is finalized and durably rowed, let the
+        # upper model review the lower model's recent work every N turns.
+        # Synchronous + non-fatal:
+        #   CORRECT  → inject guidance for the next turn
+        #   ESCALATE → flag the next turn onto the top tier (apply_turn_routing)
+        #   FLAG     → surface a concern to the user via the transcript
+        # Runs only on a real, uninterrupted, non-failed answer.
+        if final_response and not interrupted and not failed:
+            try:
+                from agent.routing.oversight import (
+                    run_oversight_if_due,
+                    build_oversight_injection,
+                    OversightAction,
+                )
+
+                _ov = run_oversight_if_due(
+                    agent, messages, getattr(agent, "_user_turn_count", 0)
+                )
+                if _ov is not None:
+                    _reviewer = getattr(agent, "_oversight_reviewer", None)
+                    _ov_model = _reviewer.config.model if _reviewer else "oversight"
+                    if _ov.action == OversightAction.CORRECT:
+                        messages.append(build_oversight_injection(_ov, _ov_model))
+                        logger.info("oversight: injected correction for next turn")
+                    elif _ov.action == OversightAction.ESCALATE:
+                        agent._oversight_escalation_pending = True
+                        logger.warning(
+                            "oversight: ESCALATION requested — %s", _ov.reason
+                        )
+                    elif _ov.action == OversightAction.FLAG:
+                        logger.warning("oversight: FLAG — %s", _ov.warning)
+                        # No portable async user-notify channel across
+                        # CLI/TUI/gateway — surface the concern into the
+                        # transcript so it reaches the user next turn.
+                        messages.append(
+                            {
+                                "role": "system",
+                                "content": (
+                                    f"[OVERSIGHT FLAG from {_ov_model}]: "
+                                    f"{_ov.warning}"
+                                ),
+                            }
+                        )
+            except Exception as _ov_exc:
+                logger.warning("oversight hook failed: %s", _ov_exc)
+
         # The model has completed its request, so replace API-local
         # voice/model/skill guidance with the clean user input before writing the
         # final durable snapshot and returning the continuation history. Earlier
